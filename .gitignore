@@ -11,6 +11,8 @@ venv/
 *.html
 *.svg
 !requirements.json
+!package.json
+!package-lock.json
 .gitnexus
 
 # MemPalace per-project files (issue #185)
