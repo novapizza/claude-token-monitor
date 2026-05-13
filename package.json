@@ -1,0 +1,39 @@
+{
+  "name": "claude-code-token-monitor",
+  "version": "0.1.0",
+  "description": "Read Claude Code session logs and report token usage, cost, and budget — works without Python.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "tokens",
+    "usage",
+    "cost",
+    "cli"
+  ],
+  "homepage": "https://github.com/emtyty/claude-token-monitor#readme",
+  "bugs": {
+    "url": "https://github.com/emtyty/claude-token-monitor/issues"
+  },
+  "license": "MIT",
+  "author": "hueanmy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/emtyty/claude-token-monitor.git"
+  },
+  "bin": {
+    "claude-code-token-monitor": "npm/cli.js"
+  },
+  "files": [
+    "npm/cli.js",
+    "npm/install.js",
+    "npm/README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node npm/install.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

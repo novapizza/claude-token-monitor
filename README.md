@@ -11,10 +11,24 @@ already writes locally.
 
 ## Install
 
-### CLI only (just the monitor)
+### Quickest: via npm (no Python needed)
+
+```bash
+# Run once without installing
+npx claude-code-token-monitor summary
+
+# Or install globally
+npm install -g claude-code-token-monitor
+claude-code-token-monitor --help
+```
+
+The npm package downloads a pre-built native binary for your OS (macOS x64/arm64, Linux x64/arm64, Windows x64) — no Python runtime required.
+
+### CLI from source (Python)
 
 ```bash
 pip install -r requirements.txt
+python monitor.py --help
 ```
 
 ### CLI + routing plugin (recommended)

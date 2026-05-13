@@ -1,0 +1,107 @@
+name: Release
+
+# Triggered by pushing a version tag (e.g. `git tag v0.1.0 && git push --tags`).
+# Builds platform binaries via PyInstaller, attaches them to a GitHub Release,
+# then publishes the npm wrapper. The npm postinstall downloads the matching
+# binary from the Release, so the Release must exist before npm publish runs.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            asset: claude-code-token-monitor-darwin-x64
+            ext: ''
+          - os: macos-14
+            asset: claude-code-token-monitor-darwin-arm64
+            ext: ''
+          - os: ubuntu-latest
+            asset: claude-code-token-monitor-linux-x64
+            ext: ''
+          - os: ubuntu-24.04-arm
+            asset: claude-code-token-monitor-linux-arm64
+            ext: ''
+          - os: windows-latest
+            asset: claude-code-token-monitor-win32-x64.exe
+            ext: '.exe'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build single-file binary
+        shell: bash
+        run: pyinstaller --onefile --name claude-code-token-monitor monitor.py
+
+      - name: Rename for release asset
+        shell: bash
+        run: mv "dist/claude-code-token-monitor${{ matrix.ext }}" "dist/${{ matrix.asset }}"
+
+      - name: Smoke test (non-Windows)
+        if: runner.os != 'Windows'
+        run: ./dist/${{ matrix.asset }} --help >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+
+  publish-npm:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Sync package.json version with tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          node -e "const fs=require('fs');const p=require('./package.json');p.version='${TAG}';fs.writeFileSync('./package.json',JSON.stringify(p,null,2)+'\n');"
+          echo "Published version: ${TAG}"
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
