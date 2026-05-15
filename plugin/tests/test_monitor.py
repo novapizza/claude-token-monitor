@@ -143,12 +143,38 @@ class CalcCostTest(unittest.TestCase):
         cost = monitor.calc_cost(usage, "claude-sonnet-4-6")
         self.assertAlmostEqual(cost, 18.0, places=4)
 
-    def test_opus_4_pricing(self):
-        # 1M input @ $15, 1M output @ $75  →  $90
+    def test_opus_4_7_pricing(self):
+        # Opus 4.5+ pricing: 1M input @ $5, 1M output @ $25  →  $30
         usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000,
                  "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
         cost = monitor.calc_cost(usage, "claude-opus-4-7")
+        self.assertAlmostEqual(cost, 30.0, places=4)
+
+    def test_opus_4_1_pricing(self):
+        # Legacy Opus 4/4.1 pricing: 1M input @ $15, 1M output @ $75  →  $90
+        usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000,
+                 "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        cost = monitor.calc_cost(usage, "claude-opus-4-1")
         self.assertAlmostEqual(cost, 90.0, places=4)
+
+    def test_cache_write_split_5m_vs_1h(self):
+        # 1M of 5m write at $3.75 + 1M of 1h write at $6 (sonnet) = $9.75
+        usage = {"input_tokens": 0, "output_tokens": 0,
+                 "cache_read_input_tokens": 0,
+                 "cache_creation": {
+                     "ephemeral_5m_input_tokens": 1_000_000,
+                     "ephemeral_1h_input_tokens": 1_000_000,
+                 }}
+        cost = monitor.calc_cost(usage, "claude-sonnet-4-6")
+        self.assertAlmostEqual(cost, 9.75, places=4)
+
+    def test_cache_write_legacy_field_treated_as_5m(self):
+        # Legacy combined field, no nested split → priced at 5m rate
+        usage = {"input_tokens": 0, "output_tokens": 0,
+                 "cache_read_input_tokens": 0,
+                 "cache_creation_input_tokens": 1_000_000}
+        cost = monitor.calc_cost(usage, "claude-sonnet-4-6")
+        self.assertAlmostEqual(cost, 3.75, places=4)
 
     def test_cache_pricing(self):
         # 10M cache_read @ $0.30/1M = $3 (sonnet)
@@ -573,14 +599,14 @@ class FullPipelineSmokeTest(unittest.TestCase):
             root = Path(tmp)
             # Synthesize an Opus-routine session: 25 calls, all Opus, small
             # outputs (<500 avg). Token sizes chosen so total cost > $5
-            # (the rule's lower bound).
+            # (the rule's lower bound) at Opus 4.5+ rates ($5 in / $25 out).
             proj = root / "c--Users-u-proj"
             events = [
                 _assistant_event(
                     session_id="sess1", msg_id=f"m{i}",
                     timestamp=f"2026-04-15T{i % 24:02d}:00:00.000Z",
                     model="claude-opus-4-6",
-                    input_tokens=20_000, output_tokens=300,
+                    input_tokens=60_000, output_tokens=300,
                     cache_read=10_000, cache_create=0,
                 )
                 for i in range(25)

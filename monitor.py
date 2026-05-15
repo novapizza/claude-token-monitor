@@ -37,18 +37,23 @@ except ImportError:  # graceful fallback
     RICH = False
 
 
-# Pricing per 1M tokens (USD). Kept in one place so it's easy to tune.
-# Matched by substring against the model name reported in the JSONL.
+# Pricing per 1M tokens (USD). Source: platform.claude.com/docs/en/docs/about-claude/pricing
+# Order matters: most-specific prefix first (first substring match wins in model_price).
+# cw_5m = 5-minute cache write (1.25x input), cw_1h = 1-hour cache write (2x input).
 PRICING: dict[str, dict[str, float]] = {
-    "claude-opus-4":     {"in": 15.0, "out": 75.0, "cr": 1.50, "cw": 18.75},
-    "claude-sonnet-4":   {"in":  3.0, "out": 15.0, "cr": 0.30, "cw":  3.75},
-    "claude-haiku-4":    {"in":  1.0, "out":  5.0, "cr": 0.10, "cw":  1.25},
-    "claude-3-5-sonnet": {"in":  3.0, "out": 15.0, "cr": 0.30, "cw":  3.75},
-    "claude-3-5-haiku":  {"in":  0.8, "out":  4.0, "cr": 0.08, "cw":  1.00},
-    "claude-3-opus":     {"in": 15.0, "out": 75.0, "cr": 1.50, "cw": 18.75},
-    "claude-3-haiku":    {"in": 0.25, "out": 1.25, "cr": 0.03, "cw":  0.30},
+    "claude-opus-4-7":   {"in":  5.0, "out": 25.0, "cr": 0.50, "cw_5m":  6.25, "cw_1h": 10.0},
+    "claude-opus-4-6":   {"in":  5.0, "out": 25.0, "cr": 0.50, "cw_5m":  6.25, "cw_1h": 10.0},
+    "claude-opus-4-5":   {"in":  5.0, "out": 25.0, "cr": 0.50, "cw_5m":  6.25, "cw_1h": 10.0},
+    "claude-opus-4-1":   {"in": 15.0, "out": 75.0, "cr": 1.50, "cw_5m": 18.75, "cw_1h": 30.0},
+    "claude-opus-4":     {"in": 15.0, "out": 75.0, "cr": 1.50, "cw_5m": 18.75, "cw_1h": 30.0},
+    "claude-sonnet-4":   {"in":  3.0, "out": 15.0, "cr": 0.30, "cw_5m":  3.75, "cw_1h":  6.0},
+    "claude-haiku-4":    {"in":  1.0, "out":  5.0, "cr": 0.10, "cw_5m":  1.25, "cw_1h":  2.0},
+    "claude-3-5-sonnet": {"in":  3.0, "out": 15.0, "cr": 0.30, "cw_5m":  3.75, "cw_1h":  6.0},
+    "claude-3-5-haiku":  {"in":  0.8, "out":  4.0, "cr": 0.08, "cw_5m":  1.00, "cw_1h":  1.6},
+    "claude-3-opus":     {"in": 15.0, "out": 75.0, "cr": 1.50, "cw_5m": 18.75, "cw_1h": 30.0},
+    "claude-3-haiku":    {"in": 0.25, "out": 1.25, "cr": 0.03, "cw_5m":  0.30, "cw_1h":  0.48},
 }
-DEFAULT_PRICE = {"in": 3.0, "out": 15.0, "cr": 0.30, "cw": 3.75}
+DEFAULT_PRICE = {"in": 3.0, "out": 15.0, "cr": 0.30, "cw_5m": 3.75, "cw_1h": 6.0}
 
 
 def model_price(model: str) -> dict[str, float]:
@@ -64,12 +69,20 @@ def calc_cost(usage: dict, model: str) -> float:
     inp = int(usage.get("input_tokens") or 0)
     out = int(usage.get("output_tokens") or 0)
     cr = int(usage.get("cache_read_input_tokens") or 0)
-    cw = int(usage.get("cache_creation_input_tokens") or 0)
+    # Cache writes come in two TTLs at different rates. Newer payloads split
+    # them under `cache_creation`; legacy payloads only carry the combined
+    # `cache_creation_input_tokens`, which we treat as 5-minute (the default).
+    creation = usage.get("cache_creation") or {}
+    cw_5m = int(creation.get("ephemeral_5m_input_tokens") or 0)
+    cw_1h = int(creation.get("ephemeral_1h_input_tokens") or 0)
+    if not creation:
+        cw_5m = int(usage.get("cache_creation_input_tokens") or 0)
     return (
-        inp * p["in"]  / 1_000_000
-        + out * p["out"] / 1_000_000
-        + cr  * p["cr"]  / 1_000_000
-        + cw  * p["cw"]  / 1_000_000
+        inp   * p["in"]    / 1_000_000
+        + out * p["out"]   / 1_000_000
+        + cr  * p["cr"]    / 1_000_000
+        + cw_5m * p["cw_5m"] / 1_000_000
+        + cw_1h * p["cw_1h"] / 1_000_000
     )
 
 
@@ -425,14 +438,20 @@ def _sum_subagent_usage(subagent_file: Path) -> dict:
             agg["cr"]  += int(usage.get("cache_read_input_tokens") or 0)
             agg["cw"]  += int(usage.get("cache_creation_input_tokens") or 0)
     def _cost_with(price: dict) -> float:
+        # Aggregated cw is the combined 5m+1h token count (the split is only
+        # recoverable from raw per-call usage). Price at the 5m rate, which is
+        # the default TTL — slight under-estimate when 1h caching is in play,
+        # but consistent across both sides of the actual-vs-Opus comparison.
         return (
-            agg["in"]  * price["in"]  / 1_000_000
+            agg["in"]  * price["in"]    / 1_000_000
             + agg["out"] * price["out"] / 1_000_000
             + agg["cr"]  * price["cr"]  / 1_000_000
-            + agg["cw"]  * price["cw"]  / 1_000_000
+            + agg["cw"]  * price["cw_5m"] / 1_000_000
         )
     cost_actual = _cost_with(model_price(model))
-    cost_opus = _cost_with(PRICING["claude-opus-4"])
+    # Hypothetical baseline: the parent would have done this work on its own
+    # model. Today that's Opus 4.6/4.7 at $5/$25 — not legacy Opus 4 at $15/$75.
+    cost_opus = _cost_with(PRICING["claude-opus-4-7"])
     return {**agg, "cost_actual": cost_actual, "cost_opus": cost_opus, "model": model}
 
 
@@ -1959,7 +1978,7 @@ def _rule_session_fragmentation(records: list[Record]) -> list[Suggestion]:
         buckets[key][r.session_id] += 1
         p = model_price(r.model)
         cw = int(r.usage.get("cache_creation_input_tokens") or 0)
-        cw_cost[key] += cw * p["cw"] / 1_000_000
+        cw_cost[key] += cw * p["cw_5m"] / 1_000_000
     out: list[Suggestion] = []
     for (project, day), sess_counts in buckets.items():
         short_sess = [s for s, n in sess_counts.items() if n < 5]
@@ -2013,7 +2032,7 @@ def _rule_cache_rebuild(records: list[Record]) -> list[Suggestion]:
         # price the excess at average per-token cw rate for the session
         total_cost_cw = sum(
             int(r.usage.get("cache_creation_input_tokens") or 0)
-            * model_price(r.model)["cw"] / 1_000_000
+            * model_price(r.model)["cw_5m"] / 1_000_000
             for r in recs
         )
         rate = total_cost_cw / max(1, cw)
