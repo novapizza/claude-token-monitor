@@ -8,6 +8,7 @@ sessions, export, live.
 from __future__ import annotations
 
 import argparse
+import calendar as _calendar
 import csv
 import json
 import os
@@ -109,6 +110,148 @@ def context_cap(model: str) -> int:
 def projects_root() -> Path:
     home = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())
     return home / ".claude" / "projects"
+
+
+def credentials_path() -> Path:
+    home = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())
+    return home / ".claude" / ".credentials.json"
+
+
+# Raw `subscriptionType` values seen in ~/.claude/.credentials.json mapped to
+# display labels. Unknowns fall back to title-cased raw value.
+_SUBSCRIPTION_LABELS: dict[str, str] = {
+    "max_20x":    "Max 20x",
+    "max_5x":     "Max 5x",
+    "max":        "Max",
+    "pro":        "Pro",
+    "free":       "Free",
+    "team":       "Team",
+    "enterprise": "Enterprise",
+}
+_PAID_SUBSCRIPTIONS = {"pro", "max", "max_5x", "max_20x", "team", "enterprise"}
+
+
+def read_subscription_info() -> dict | None:
+    """Return {'type': 'Max 20x', 'rate_limit_tier': str|None, 'raw': str} or None.
+
+    Reads `~/.claude/.credentials.json`. macOS stores credentials in the
+    Keychain (service `Claude Code-credentials`); that path is not implemented
+    here, so macOS users get no banner — costs still display correctly.
+    """
+    try:
+        data = json.loads(credentials_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    oauth = data.get("claudeAiOauth") or {}
+    sub_raw = str(oauth.get("subscriptionType") or "").strip().lower()
+    if not sub_raw:
+        return None
+    return {
+        "type":            _SUBSCRIPTION_LABELS.get(sub_raw, sub_raw.replace("_", " ").title()),
+        "rate_limit_tier": oauth.get("rateLimitTier"),
+        "raw":             sub_raw,
+    }
+
+
+def is_subscription_user(info: dict | None) -> bool:
+    return bool(info) and info["raw"] in _PAID_SUBSCRIPTIONS
+
+
+def history_path() -> Path:
+    home = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())
+    return home / ".claude" / "history.jsonl"
+
+
+@dataclass
+class UserInput:
+    """A single user-typed line from `~/.claude/history.jsonl`.
+
+    Privacy contract: `display` is never retained — only the slash command (if
+    any) and the total pasted-content character count. We never write the
+    user's raw prompt text to any report.
+    """
+    timestamp: int            # ms since epoch (as logged by Claude Code)
+    dt: datetime              # parsed UTC datetime
+    session_id: str
+    project: str
+    is_slash: bool
+    slash_command: str        # "/clear" -> "clear"; "" when is_slash False
+    paste_chars: int          # total chars across pastedContents values
+
+
+def _parse_user_input(d: dict) -> UserInput | None:
+    """Extract privacy-safe fields from one history.jsonl row. Returns None on bad rows."""
+    ts_ms = d.get("timestamp")
+    if not isinstance(ts_ms, (int, float)):
+        return None
+    display = d.get("display") or ""
+    is_slash = isinstance(display, str) and display.startswith("/")
+    slash_cmd = ""
+    if is_slash:
+        # "/clear" -> "clear"; "/plugin install foo@bar" -> "plugin"
+        tail = display[1:].lstrip()
+        slash_cmd = tail.split(None, 1)[0] if tail else ""
+    pasted = d.get("pastedContents") or {}
+    paste_chars = 0
+    if isinstance(pasted, dict):
+        for v in pasted.values():
+            if isinstance(v, str):
+                paste_chars += len(v)
+            elif isinstance(v, dict):
+                # newer schema may nest the text under a key
+                t = v.get("content") or v.get("text") or ""
+                if isinstance(t, str):
+                    paste_chars += len(t)
+    try:
+        dt = datetime.fromtimestamp(int(ts_ms) / 1000.0).astimezone()
+    except (OverflowError, OSError, ValueError):
+        return None
+    return UserInput(
+        timestamp=int(ts_ms),
+        dt=dt,
+        session_id=str(d.get("sessionId") or ""),
+        project=str(d.get("project") or ""),
+        is_slash=is_slash,
+        slash_command=slash_cmd,
+        paste_chars=paste_chars,
+    )
+
+
+def load_user_inputs() -> list[UserInput]:
+    """Stream `~/.claude/history.jsonl` into UserInput records. Empty list on absent/bad file."""
+    p = history_path()
+    out: list[UserInput] = []
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                ui = _parse_user_input(d)
+                if ui is not None:
+                    out.append(ui)
+    except OSError:
+        return []
+    return out
+
+
+def _render_subscription_banner(console, info: dict | None) -> None:
+    if not info:
+        return
+    label = info["type"]
+    rate_tier = info.get("rate_limit_tier")
+    tier_str = f"   [dim]·[/dim] Rate tier: [cyan]{rate_tier}[/cyan]" if rate_tier else ""
+    if is_subscription_user(info):
+        console.print(
+            f"[bold]Plan:[/bold] [cyan]{label}[/cyan]{tier_str}   "
+            f"[dim]· Costs are API-equivalent — you pay a flat subscription fee.[/dim]"
+        )
+    else:
+        console.print(f"[bold]Plan:[/bold] [cyan]{label}[/cyan]{tier_str}")
 
 
 def decode_project(folder: str) -> str:
@@ -554,6 +697,56 @@ def collect_routing_stats(root: Path, project_filter: str | None = None) -> list
 # ------------------------------- Commands ------------------------------- #
 
 
+def _recent_activity_snapshot(records: list) -> dict:
+    """Compute today / yesterday / 30-day average and month-to-date totals.
+
+    Returns dict with keys: today_cost, today_calls, yday_cost, yday_calls,
+    win30_cost, win30_days, avg_30, mtd_cost, days_elapsed, days_in_month,
+    projected_month.
+    """
+    today = date.today()
+    yday = today - timedelta(days=1)
+    win30_start = today - timedelta(days=29)
+    month_start = today.replace(day=1)
+    days_in_month = _calendar.monthrange(today.year, today.month)[1]
+    days_elapsed = (today - month_start).days + 1
+
+    today_cost = today_calls = 0
+    yday_cost = yday_calls = 0
+    win30_cost = mtd_cost = 0.0
+    active_days_30: set[date] = set()
+    for r in records:
+        ts = parse_ts(r.timestamp)
+        if ts is None:
+            continue
+        d = ts.astimezone().date()
+        if d == today:
+            today_cost += r.cost
+            today_calls += 1
+        elif d == yday:
+            yday_cost += r.cost
+            yday_calls += 1
+        if win30_start <= d <= today:
+            win30_cost += r.cost
+            active_days_30.add(d)
+        if d >= month_start:
+            mtd_cost += r.cost
+
+    avg_30 = win30_cost / len(active_days_30) if active_days_30 else 0.0
+    projected_month = mtd_cost / days_elapsed * days_in_month if days_elapsed else 0.0
+    return {
+        "today_cost": today_cost, "today_calls": today_calls,
+        "yday_cost": yday_cost,   "yday_calls": yday_calls,
+        "win30_cost": win30_cost, "win30_days": len(active_days_30),
+        "avg_30": avg_30,
+        "mtd_cost": mtd_cost,
+        "days_elapsed": days_elapsed,
+        "days_in_month": days_in_month,
+        "projected_month": projected_month,
+        "month_start": month_start,
+    }
+
+
 def cmd_summary(args) -> None:
     records = load_records(args)
     if not records:
@@ -572,16 +765,28 @@ def cmd_summary(args) -> None:
 
     by_model = aggregate(records, lambda r: r.model)
     sessions = {r.session_id for r in records if r.session_id}
+    sub = read_subscription_info()
+    snap = _recent_activity_snapshot(records)
 
     if not RICH:
+        if sub:
+            tag = " (subscription — costs are API-equivalent)" if is_subscription_user(sub) else ""
+            print(f"Plan: {sub['type']}{tag}")
         print(f"Sessions: {len(sessions)}   API calls: {total['calls']}")
         print(f"Input:  {fmt_num(total['in'])}   Output: {fmt_num(total['out'])}")
         print(f"Cache R:{fmt_num(total['cr'])}   Cache W:{fmt_num(total['cw'])}")
         print(f"Cost:   {fmt_cost(total['cost'])}")
+        print(f"Today: {fmt_cost(snap['today_cost'])} ({snap['today_calls']} calls)   "
+              f"Yesterday: {fmt_cost(snap['yday_cost'])} ({snap['yday_calls']} calls)   "
+              f"30-day avg: {fmt_cost(snap['avg_30'])}/day ({snap['win30_days']} active days)")
+        print(f"Month-to-date: {fmt_cost(snap['mtd_cost'])} "
+              f"(day {snap['days_elapsed']}/{snap['days_in_month']})   "
+              f"Projected end-of-month at current pace: {fmt_cost(snap['projected_month'])}")
         return
 
     console = Console()
     console.rule("[bold]Claude Code Token Usage[/bold]")
+    _render_subscription_banner(console, sub)
     console.print(f"Sessions: [cyan]{len(sessions)}[/cyan]   "
                   f"API calls: [cyan]{total['calls']}[/cyan]   "
                   f"Est. cost: [green]{fmt_cost(total['cost'])}[/green]")
@@ -614,10 +819,105 @@ def cmd_summary(args) -> None:
         )
     console.print(t)
 
+    _render_recent_activity(console, snap)
+    _render_user_input_summary(console, load_user_inputs(), args)
+
     suggestions = analyze_suggestions(records)
     _render_alert_banners(console, suggestions)
     if suggestions:
         _render_suggestions(console, suggestions, top=5)
+
+    if getattr(args, "vibes", False):
+        console.rule("[bold magenta]vibes[/bold magenta]")
+        vstats = collect_vibes_stats(records, projects_root())
+        if vstats["user_msg_total"] == 0:
+            console.print("[dim]No user messages found yet.[/dim]")
+        else:
+            _render_vibes(console, vstats)
+
+
+def _render_user_input_summary(console, inputs: list, args) -> None:
+    """Privacy-safe histogram of slash commands + total paste volume.
+
+    Reads `~/.claude/history.jsonl` (already parsed into UserInput). Filters
+    by the same time window as the rest of the summary.
+    """
+    if not inputs:
+        return
+    since, until = parse_window(args)
+    filtered = []
+    for ui in inputs:
+        if since is not None and ui.dt < since:
+            continue
+        if until is not None and ui.dt > until:
+            continue
+        filtered.append(ui)
+    if not filtered:
+        return
+
+    slash_counts: dict[str, int] = defaultdict(int)
+    total_paste = 0
+    paste_events = 0
+    for ui in filtered:
+        if ui.is_slash and ui.slash_command:
+            slash_counts[ui.slash_command] += 1
+        if ui.paste_chars > 0:
+            total_paste += ui.paste_chars
+            paste_events += 1
+
+    if not slash_counts and not paste_events:
+        return
+
+    t = Table(title="User Input (privacy-safe — counts only)",
+              box=box.SIMPLE_HEAVY, show_header=False)
+    t.add_column("Metric", no_wrap=True)
+    t.add_column("Value")
+
+    t.add_row("Inputs recorded", str(len(filtered)))
+    if slash_counts:
+        top = sorted(slash_counts.items(), key=lambda kv: -kv[1])[:6]
+        hist = "  ".join(f"[cyan]/{cmd}[/cyan] ×{n}" for cmd, n in top)
+        t.add_row("Top slash commands", hist)
+    if paste_events:
+        # Rough token estimate: ~4 chars per token (English/code average).
+        est_tokens = total_paste // 4
+        t.add_row("Pasted into Claude",
+                  f"{fmt_num(total_paste)} chars across {paste_events} input(s)  "
+                  f"[dim](≈ {fmt_num(est_tokens)} tokens)[/dim]")
+    console.print(t)
+
+
+def _render_recent_activity(console, snap: dict) -> None:
+    today_vs_avg = ""
+    if snap["avg_30"] > 0:
+        ratio = snap["today_cost"] / snap["avg_30"]
+        if ratio >= 1.5:
+            today_vs_avg = f"  [yellow]({ratio:.1f}× 30-day avg)[/yellow]"
+        elif ratio >= 0.8:
+            today_vs_avg = f"  [dim]({ratio:.1f}× 30-day avg)[/dim]"
+        else:
+            today_vs_avg = f"  [green]({ratio:.1f}× 30-day avg)[/green]"
+
+    proj_vs_mtd = ""
+    if snap["mtd_cost"] > 0:
+        proj_vs_mtd = (
+            f"  [dim](= ${snap['mtd_cost']:.2f} mtd × "
+            f"{snap['days_in_month']}/{snap['days_elapsed']})[/dim]"
+        )
+
+    t = Table(title="Recent Activity", box=box.SIMPLE_HEAVY, show_header=False)
+    t.add_column("Scope", no_wrap=True)
+    t.add_column("Value")
+    t.add_row("Today",      f"[cyan]{fmt_cost(snap['today_cost'])}[/cyan]  "
+                            f"({snap['today_calls']} calls){today_vs_avg}")
+    t.add_row("Yesterday",  f"{fmt_cost(snap['yday_cost'])}  ({snap['yday_calls']} calls)")
+    t.add_row("30-day avg", f"{fmt_cost(snap['avg_30'])}/day  "
+                            f"[dim]({snap['win30_days']} active days)[/dim]")
+    t.add_row(f"MTD ({snap['month_start']:%b %Y})",
+              f"{fmt_cost(snap['mtd_cost'])}  "
+              f"[dim](day {snap['days_elapsed']}/{snap['days_in_month']})[/dim]")
+    t.add_row("Projected EOM", f"[bold]{fmt_cost(snap['projected_month'])}[/bold]{proj_vs_mtd}")
+    console.print(t)
 
 
 def cmd_daily(args) -> None:
@@ -778,6 +1078,7 @@ def cmd_live(args) -> None:
     warn_override  = getattr(args, "context_warn",  None)
     alert_override = getattr(args, "context_alert", None)
     budget_daily = getattr(args, "budget_daily", None)
+    sub_info = read_subscription_info()
 
     def _ctx_tokens(r: Record) -> int:
         u = r.usage
@@ -802,8 +1103,12 @@ def cmd_live(args) -> None:
                 total[k] += a[k]
             total["cost"] += a["cost"]
 
+        title = f"Claude Code Live Monitor  —  {now.strftime('%Y-%m-%d %H:%M:%S')}"
+        if sub_info:
+            tag = " · API-equiv $" if is_subscription_user(sub_info) else ""
+            title += f"   [Plan: {sub_info['type']}{tag}]"
         t = Table(
-            title=f"Claude Code Live Monitor  —  {now.strftime('%Y-%m-%d %H:%M:%S')}",
+            title=title,
             box=box.ROUNDED, show_header=True, header_style="bold",
         )
         t.add_column("Scope"); t.add_column("Calls", justify="right")
@@ -2463,6 +2768,89 @@ def _rule_cache_cold_session(records: list[Record]) -> list[Suggestion]:
     return out
 
 
+_EXCESSIVE_CLEAR_MIN = 3  # ≥3 /clear in one session → flagged
+
+
+def _rule_excessive_clear(records: list[Record]) -> list[Suggestion]:
+    """Rule 14: sessions where the user ran `/clear` ≥3 times.
+
+    Each `/clear` discards the prompt cache, forcing the next assistant turn
+    to rebuild it at 5–8× the cache-read rate. Sessions with repeated clears
+    pay this cost again and again.
+
+    Loads `~/.claude/history.jsonl` directly (it's only ~user-input metadata).
+    Correlates by `sessionId` with the existing record set.
+    """
+    inputs = load_user_inputs()
+    if not inputs:
+        return []
+    clears_by_session: dict[str, int] = defaultdict(int)
+    for ui in inputs:
+        if ui.is_slash and ui.slash_command == "clear" and ui.session_id:
+            clears_by_session[ui.session_id] += 1
+    flagged = {s: n for s, n in clears_by_session.items() if n >= _EXCESSIVE_CLEAR_MIN}
+    if not flagged:
+        return []
+
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id in flagged:
+            by_session[r.session_id].append(r)
+
+    out: list[Suggestion] = []
+    for sess, n_clears in flagged.items():
+        recs = by_session.get(sess) or []
+        if not recs:
+            # /clear was logged but no assistant turns landed in records — skip,
+            # nothing to attribute waste to.
+            continue
+        # Lower-bound estimate of waste: each clear after the first forces a
+        # full cache rebuild on the next turn. Use the median per-call cache
+        # creation cost in this session × (n_clears - 1) as the rebuild waste.
+        cw_costs = []
+        for r in recs:
+            u = r.usage
+            creation = u.get("cache_creation") or {}
+            cw_5m = int(creation.get("ephemeral_5m_input_tokens") or 0)
+            cw_1h = int(creation.get("ephemeral_1h_input_tokens") or 0)
+            if not creation:
+                cw_5m = int(u.get("cache_creation_input_tokens") or 0)
+            p = model_price(r.model)
+            cost_cw = cw_5m * p["cw_5m"] / 1_000_000 + cw_1h * p["cw_1h"] / 1_000_000
+            if cost_cw > 0:
+                cw_costs.append(cost_cw)
+        if cw_costs:
+            cw_costs.sort()
+            median_cw = cw_costs[len(cw_costs) // 2]
+        else:
+            median_cw = 0.0
+        # Each clear after the first contributes ~one extra full rebuild.
+        savings = median_cw * (n_clears - 1)
+        session_cost = sum(r.cost for r in recs)
+        projects = {decode_project(r.project) for r in recs}
+        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
+        severity = "high" if n_clears >= 5 else "med"
+        out.append(Suggestion(
+            rule="excessive-clear",
+            severity=severity,
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=(
+                f"{n_clears} `/clear` in session · {len(recs)} model turn(s) · "
+                f"session cost {fmt_cost(session_cost)} · "
+                f"median cache rebuild per turn {fmt_cost(median_cw)}"
+            ),
+            action=(
+                "Each `/clear` discards the prompt cache — the next turn pays "
+                "the full cache-write rate again. If you're clearing to swap "
+                "context, prefer ending the session and starting a fresh one "
+                "(same cost, cleaner separation). If you're clearing because "
+                "context got bloated, split the work earlier instead."
+            ),
+            est_savings=savings,
+        ))
+    return out
+
+
 def analyze_suggestions(records: list[Record]) -> list[Suggestion]:
     rules = [
         _rule_opus_heavy_project,
@@ -2478,6 +2866,7 @@ def analyze_suggestions(records: list[Record]) -> list[Suggestion]:
         _rule_large_context,
         _rule_expensive_single_call,
         _rule_cache_cold_session,
+        _rule_excessive_clear,
     ]
     out: list[Suggestion] = []
     for rule in rules:
@@ -2592,6 +2981,8 @@ def cmd_budget(args) -> None:
     records = load_all()
     today = date.today()
     month_start = today.replace(day=1)
+    days_in_month = _calendar.monthrange(today.year, today.month)[1]
+    days_elapsed = (today - month_start).days + 1
     quarter_num = (today.month - 1) // 3 + 1
     quarter_start = date(today.year, (quarter_num - 1) * 3 + 1, 1)
     year_start = date(today.year, 1, 1)
@@ -2615,6 +3006,9 @@ def cmd_budget(args) -> None:
         if d >= rolling_30_start:
             rolling_cost += r.cost
 
+    # Linear projection of this month's spend at the current daily pace.
+    projected_month = month_cost / days_elapsed * days_in_month if days_elapsed else 0.0
+
     # Always show today + this month. Higher-period rows only render when
     # the user passed a corresponding limit flag.
     rows: list[tuple[str, float, float | None]] = [
@@ -2633,6 +3027,10 @@ def cmd_budget(args) -> None:
 
     worst_frac = 0.0
     if not RICH:
+        sub = read_subscription_info()
+        if sub:
+            tag = " (subscription — API-equivalent)" if is_subscription_user(sub) else ""
+            print(f"Plan: {sub['type']}{tag}")
         for label, spent, limit in rows:
             if limit:
                 frac = spent / limit
@@ -2640,8 +3038,20 @@ def cmd_budget(args) -> None:
                 print(f"{label:20s}  {fmt_cost(spent)} / {fmt_cost(limit)}  ({frac*100:5.1f}%)")
             else:
                 print(f"{label:20s}  {fmt_cost(spent)}  (no limit set)")
+        # Month-end projection at current daily pace.
+        proj_tag = ""
+        if args.monthly:
+            proj_frac = projected_month / args.monthly
+            worst_frac = max(worst_frac, proj_frac)
+            proj_tag = f" / {fmt_cost(args.monthly)}  ({proj_frac*100:5.1f}%)"
+            if proj_frac >= 1.0:
+                proj_tag += "  ⚠ projected to exceed monthly budget"
+        print(f"{'Projected EOM':20s}  {fmt_cost(projected_month)}{proj_tag}  "
+              f"(at {fmt_cost(month_cost/days_elapsed)}/day, "
+              f"{days_elapsed}/{days_in_month} days elapsed)")
     else:
         console = Console()
+        _render_subscription_banner(console, read_subscription_info())
         t = Table(title="Cost Budget", box=box.SIMPLE_HEAVY)
         t.add_column("Scope", no_wrap=True); t.add_column("Spent", justify="right", no_wrap=True)
         t.add_column("Limit", justify="right", no_wrap=True); t.add_column("%", justify="right", no_wrap=True)
@@ -2663,6 +3073,32 @@ def cmd_budget(args) -> None:
                           f"{frac*100:.1f}%", bar, status)
             else:
                 t.add_row(label, fmt_cost(spent), "-", "-", "", "[dim]no limit[/dim]")
+
+        # Projection row — always shown; gated against --monthly when set.
+        proj_label = f"Projected EOM ({month_start:%b})"
+        proj_spent = fmt_cost(projected_month)
+        proj_note = f"[dim]pace {fmt_cost(month_cost/days_elapsed)}/day · " \
+                    f"day {days_elapsed}/{days_in_month}[/dim]"
+        if args.monthly:
+            proj_frac = projected_month / args.monthly
+            worst_frac = max(worst_frac, proj_frac)
+            bar_width = 16
+            filled = min(bar_width, int(proj_frac * bar_width))
+            if proj_frac >= 1.0:
+                color = "red"
+                status = "[bold red]PROJ OVER[/bold red]"
+            elif proj_frac >= args.warn_at:
+                color = "yellow"
+                status = f"[bold yellow]PROJ WARN[/bold yellow]"
+            else:
+                color = "green"
+                status = "[green]on track[/green]"
+            bar = f"[{color}]{'█' * filled}[/{color}]{'░' * (bar_width - filled)}"
+            t.add_row(proj_label, proj_spent, fmt_cost(args.monthly),
+                      f"{proj_frac*100:.1f}%", bar, status)
+        else:
+            t.add_row(proj_label, proj_spent, "-", "-", "", proj_note)
+
         console.print(t)
         if worst_frac >= 1.0:
             console.print(f"[bold red]Budget exceeded.[/bold red]")
@@ -2676,6 +3112,497 @@ def cmd_budget(args) -> None:
         if worst_frac >= args.warn_at:
             sys.exit(2)
     sys.exit(0)
+
+
+# ----------------------- Vibes (opt-in via --vibes) ----------------------- #
+#
+# Aggregates user-message text and behaviour into a single character-sheet
+# panel. All naming below is original to this project — the achievements,
+# classes, and trait labels are written for this tool's terminal vibe; they
+# are NOT taken from any other extension. Keep the copy tight and dry.
+#
+# Privacy: user prompt text is scanned in-memory by the regexes in
+# `_VIBE_PATTERNS`. Counts are kept, the prompt text is dropped before any
+# render. Nothing prompt-derived is ever printed.
+
+import re as _re
+
+_VIBE_PATTERNS = {
+    # word-boundary + a couple of shorthand forms
+    "courtesy": _re.compile(r"\b(please|pls|thanks?|thank\s+you|thx|appreciated?)\b", _re.I),
+    "question": _re.compile(r"\?"),
+    "caps_burst": _re.compile(r"\b[A-Z]{4,}\b"),
+    "curse": _re.compile(r"\b(wtf|fuck(ing|ed)?|shit|damn|crap|ffs)\b", _re.I),
+    "confusion": _re.compile(r"\b(huh|wait,? what|i don'?t (get|understand)|confus(ed|ing))\b", _re.I),
+    "celebration": _re.compile(r"\b(nice|great|awesome|perfect|love it|brilliant|excellent)\b", _re.I),
+}
+
+
+def iter_user_texts(root: Path) -> Iterator[tuple[str, str, str, str]]:
+    """Yield (session_id, project_name, timestamp_iso, text) for each user text block.
+
+    Streams ~/.claude/projects/*/*.jsonl, reading only `type=='user'` rows.
+    Skips ide_opened_file and similar XML-tagged system noise. Used by vibes.
+    """
+    if not root.exists():
+        return
+    for project_dir in root.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for jsonl in project_dir.glob("*.jsonl"):
+            try:
+                f = jsonl.open("r", encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line[0] != "{":
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if e.get("type") != "user":
+                        continue
+                    msg = e.get("message") or {}
+                    content = msg.get("content")
+                    sid = e.get("sessionId") or ""
+                    proj = project_dir.name
+                    ts = e.get("timestamp") or ""
+                    if isinstance(content, str):
+                        yield sid, proj, ts, content
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                t = block.get("text") or ""
+                                if isinstance(t, str):
+                                    yield sid, proj, ts, t
+
+
+def _is_system_text(text: str) -> bool:
+    """Filter out IDE/system messages so they don't count as user-typed prose."""
+    head = text.lstrip()[:50].lower()
+    return head.startswith("<system-reminder") or head.startswith("<ide_opened_file") \
+        or head.startswith("<command-name") or head.startswith("<local-command-stdout")
+
+
+def collect_vibes_stats(records: list[Record], root: Path) -> dict:
+    """One pass over records + a streaming pass over user texts. Returns a dict
+    with everything needed to render the vibes panel.
+    """
+    # ---------- per-record aggregates ----------
+    total_cost = sum(r.cost for r in records)
+    total_tokens = 0
+    cache_reads = cache_writes = 0
+    by_model_cost: dict[str, float] = defaultdict(float)
+    projects: set[str] = set()
+    plan_turns = 0
+    explore_tools = 0
+    all_tools = 0
+    day_msg_counts: dict[date, int] = defaultdict(int)
+    hour_msg_counts: dict[int, int] = defaultdict(int)
+    weekday_counts: dict[int, int] = defaultdict(int)
+    night_owl = early_riser = weekend = 0
+    session_call_counts: dict[str, int] = defaultdict(int)
+    explore_tool_names = {"Read", "Grep", "Glob", "WebFetch", "WebSearch", "LS"}
+    today = date.today()
+    yday = today - timedelta(days=1)
+    cur_streak_count = 0
+
+    for r in records:
+        u = r.usage
+        total_tokens += (int(u.get("input_tokens") or 0)
+                         + int(u.get("output_tokens") or 0)
+                         + int(u.get("cache_read_input_tokens") or 0)
+                         + int(u.get("cache_creation_input_tokens") or 0))
+        cache_reads += int(u.get("cache_read_input_tokens") or 0)
+        cache_writes += int(u.get("cache_creation_input_tokens") or 0)
+        by_model_cost[r.model] += r.cost
+        projects.add(r.project)
+        for tname in (r.tools or []):
+            all_tools += 1
+            if tname == "ExitPlanMode":
+                plan_turns += 1
+            if tname in explore_tool_names:
+                explore_tools += 1
+        if r.session_id:
+            session_call_counts[r.session_id] += 1
+
+    # ---------- user-text aggregates (privacy-safe; text dropped after counting) ----------
+    counts = {k: 0 for k in _VIBE_PATTERNS}
+    user_msg_total = 0
+    user_msg_by_project: dict[str, int] = defaultdict(int)
+    paste_chars_total = 0
+    for ui in load_user_inputs():
+        paste_chars_total += ui.paste_chars
+
+    for sid, proj, ts, text in iter_user_texts(root):
+        if not text or _is_system_text(text):
+            continue
+        user_msg_total += 1
+        user_msg_by_project[proj] += 1
+        dt = parse_ts(ts)
+        if dt:
+            local = dt.astimezone()
+            d_local = local.date()
+            day_msg_counts[d_local] += 1
+            hour_msg_counts[local.hour] += 1
+            weekday_counts[local.weekday()] += 1
+            if 0 <= local.hour < 5:
+                night_owl += 1
+            elif 5 <= local.hour < 8:
+                early_riser += 1
+            if local.weekday() >= 5:
+                weekend += 1
+        for key, pat in _VIBE_PATTERNS.items():
+            if pat.search(text):
+                counts[key] += 1
+
+    # ---------- streak ----------
+    if day_msg_counts:
+        cur = today
+        if cur in day_msg_counts:
+            while cur in day_msg_counts:
+                cur_streak_count += 1
+                cur -= timedelta(days=1)
+        elif yday in day_msg_counts:
+            cur = yday
+            while cur in day_msg_counts:
+                cur_streak_count += 1
+                cur -= timedelta(days=1)
+        # Longest streak (single pass through sorted dates).
+        sorted_days = sorted(day_msg_counts.keys())
+        longest = run = 1
+        for i in range(1, len(sorted_days)):
+            if (sorted_days[i] - sorted_days[i-1]).days == 1:
+                run += 1
+                longest = max(longest, run)
+            else:
+                run = 1
+    else:
+        longest = 0
+
+    # ---------- derived ratios ----------
+    cache_hit = (cache_reads / (cache_reads + cache_writes)) if (cache_reads + cache_writes) else 0.0
+    opus_cost = sum(v for k, v in by_model_cost.items() if "opus" in k)
+    sonnet_cost = sum(v for k, v in by_model_cost.items() if "sonnet" in k)
+    haiku_cost = sum(v for k, v in by_model_cost.items() if "haiku" in k)
+    avg_session_calls = (sum(session_call_counts.values()) / len(session_call_counts)
+                         if session_call_counts else 0)
+
+    return {
+        "total_cost": total_cost,
+        "total_tokens": total_tokens,
+        "cache_hit": cache_hit,
+        "by_model_cost": dict(by_model_cost),
+        "opus_share": opus_cost / total_cost if total_cost else 0,
+        "sonnet_share": sonnet_cost / total_cost if total_cost else 0,
+        "haiku_share": haiku_cost / total_cost if total_cost else 0,
+        "n_projects": len(projects),
+        "plan_turns": plan_turns,
+        "explore_share": explore_tools / all_tools if all_tools else 0,
+        "user_msg_total": user_msg_total,
+        "user_msg_by_project": dict(user_msg_by_project),
+        "day_msg_counts": dict(day_msg_counts),
+        "hour_msg_counts": dict(hour_msg_counts),
+        "weekday_counts": dict(weekday_counts),
+        "night_owl": night_owl,
+        "early_riser": early_riser,
+        "weekend": weekend,
+        "cur_streak": cur_streak_count,
+        "longest_streak": longest,
+        "avg_session_calls": avg_session_calls,
+        "max_session_calls": max(session_call_counts.values()) if session_call_counts else 0,
+        "paste_chars_total": paste_chars_total,
+        "counts": counts,
+    }
+
+
+# Class derivation — first match wins. Original to this tool.
+def _vibes_class(stats: dict) -> str:
+    msgs = stats["user_msg_total"]
+    if stats["plan_turns"] >= 5 and stats["explore_share"] >= 0.3:
+        return "Strategist"
+    if stats["cache_hit"] >= 0.70 and stats["total_cost"] >= 50:
+        return "Resonator"
+    if stats["opus_share"] >= 0.60:
+        return "Heavy Lifter"
+    if stats["sonnet_share"] >= 0.60:
+        return "Workhorse"
+    if stats["haiku_share"] >= 0.60:
+        return "Sprinter"
+    if stats["n_projects"] >= 10:
+        return "Cartographer"
+    if stats["avg_session_calls"] >= 50 and msgs >= 200:
+        return "Marathoner"
+    if 0 < stats["avg_session_calls"] < 10 and msgs >= 200:
+        return "Quickfire"
+    return "Generalist"
+
+
+# Level — sqrt curve over (messages + 5×dollars). Caps at 99 so it stays cute.
+def _vibes_level(stats: dict) -> tuple[int, int]:
+    xp = int(stats["user_msg_total"] + 5 * stats["total_cost"])
+    import math
+    level = min(99, int(math.sqrt(max(0, xp) / 10)))
+    return level, xp
+
+
+# Achievement registry — (key, label, predicate(stats) -> bool, hint-when-unlocked).
+def _vibes_achievements(stats: dict) -> list[tuple[str, str, bool]]:
+    msgs = stats["user_msg_total"]
+    cost = stats["total_cost"]
+    tokens = stats["total_tokens"]
+    counts = stats["counts"]
+    cur_streak = stats["cur_streak"]
+    n_night = stats["night_owl"]
+    n_dawn = stats["early_riser"]
+    n_wknd = stats["weekend"]
+    avg_session = stats["avg_session_calls"]
+    courtesy_ratio = counts["courtesy"] / msgs if msgs else 0
+    question_ratio = counts["question"] / msgs if msgs else 0
+    burst_ratio = counts["caps_burst"] / msgs if msgs else 0
+    curse_ratio = counts["curse"] / msgs if msgs else 0
+    composure = 1.0 - min(1.0, curse_ratio + burst_ratio * 0.5)
+
+    # (label, unlocked?)
+    defs = [
+        ("Initiate",          msgs >= 100),
+        ("Veteran",           msgs >= 1_000),
+        ("Lifer",             msgs >= 10_000),
+        ("Cup of Coffee",     cost >= 10),
+        ("Day's Pay",         cost >= 100),
+        ("Mortgage Payment",  cost >= 1_000),
+        ("Megaton",           tokens >= 100_000_000),
+        ("Gigaton",           tokens >= 1_000_000_000),
+        ("Cache Whisperer",   stats["cache_hit"] >= 0.60),
+        ("Cache Conjurer",    stats["cache_hit"] >= 0.80),
+        ("Sonnet Loyalist",   stats["sonnet_share"] >= 0.80),
+        ("Opus Devotee",      stats["opus_share"] >= 0.80),
+        ("Polyglot",          stats["n_projects"] >= 10),
+        ("Plan B",            stats["plan_turns"] >= 10),
+        ("Insomniac",         msgs > 0 and n_night / msgs >= 0.20),
+        ("Sunrise Squad",     msgs > 0 and n_dawn / msgs >= 0.20),
+        ("Weekend Coder",     msgs > 0 and n_wknd / msgs >= 0.30),
+        (f"Streak: {cur_streak}d", cur_streak >= 7),
+        ("Marathoner",        stats["max_session_calls"] >= 200),
+        ("Tactful",           courtesy_ratio >= 0.03 and composure >= 0.90),
+        ("Polite Codec",      courtesy_ratio >= 0.05),
+        ("Inquisitor",        question_ratio >= 0.30),
+        ("Volume Pasteur",    stats["paste_chars_total"] >= 1_000_000),
+        ("First Drop",        cost >= 1),
+    ]
+    return [(label, unlocked) for label, unlocked in defs]
+
+
+# Trait scoring — three bars, each 0..1.
+def _vibes_traits(stats: dict) -> dict:
+    msgs = stats["user_msg_total"]
+    counts = stats["counts"]
+    if msgs == 0:
+        return {"manners": (0.0, "—"), "composure": (0.0, "—"), "inquiry": (0.0, "—")}
+    manners = counts["courtesy"] / msgs
+    inquiry = counts["question"] / msgs
+    curse_ratio = counts["curse"] / msgs
+    burst_ratio = counts["caps_burst"] / msgs
+    composure = max(0.0, 1.0 - (curse_ratio + burst_ratio * 0.5) * 4)  # x4 to spread
+
+    def manners_label(x):
+        if x >= 0.10: return "courtly"
+        if x >= 0.05: return "polite"
+        if x >= 0.02: return "warm"
+        if x >= 0.005: return "direct"
+        return "all business"
+
+    def composure_label(x):
+        if x >= 0.97: return "zen"
+        if x >= 0.90: return "steady"
+        if x >= 0.75: return "edgy"
+        if x >= 0.50: return "fiery"
+        return "molten"
+
+    def inquiry_label(x):
+        if x >= 0.50: return "interrogator"
+        if x >= 0.30: return "probing"
+        if x >= 0.15: return "curious"
+        if x >= 0.05: return "directive"
+        return "imperative"
+
+    return {
+        "manners":   (manners,   manners_label(manners)),
+        "composure": (composure, composure_label(composure)),
+        "inquiry":   (inquiry,   inquiry_label(inquiry)),
+    }
+
+
+_VIBE_HEAT_GLYPHS = ["·", "░", "▒", "▓", "█"]
+_WEEKDAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _vibes_heatmap_rows(day_counts: dict, days: int = 90) -> list[tuple[str, str]]:
+    """Build 7 (weekday × day-column) rows, last `days` days ending today."""
+    if not day_counts:
+        return []
+    today = date.today()
+    start = today - timedelta(days=days - 1)
+    # Bucket per (weekday, column).
+    cells: dict[tuple[int, int], int] = {}
+    for col in range(days):
+        d = start + timedelta(days=col)
+        cells[(d.weekday(), col)] = day_counts.get(d, 0)
+    peak = max(cells.values()) if cells else 0
+    if peak == 0:
+        return []
+
+    # Quintile thresholds.
+    def glyph(n: int) -> str:
+        if n <= 0:
+            return _VIBE_HEAT_GLYPHS[0]
+        frac = n / peak
+        idx = min(4, max(1, int(frac * 4) + 1))
+        return _VIBE_HEAT_GLYPHS[idx]
+
+    rows = []
+    for wd in range(7):
+        cells_row = "".join(glyph(cells.get((wd, col), 0)) for col in range(days))
+        rows.append((_WEEKDAY_ABBR[wd], cells_row))
+    return rows
+
+
+def _render_vibes(console, stats: dict) -> None:
+    """Render the full vibes character sheet. Rich-only."""
+    from rich.panel import Panel
+    cls = _vibes_class(stats)
+    level, xp = _vibes_level(stats)
+    achievements = _vibes_achievements(stats)
+    traits = _vibes_traits(stats)
+    msgs = stats["user_msg_total"]
+    cost = stats["total_cost"]
+
+    # ----- Header -----
+    header = (
+        f"[bold magenta]Class:[/bold magenta] [bold]{cls}[/bold]    "
+        f"[bold magenta]Level:[/bold magenta] [bold cyan]{level}[/bold cyan]\n"
+        f"[dim]XP:[/dim] {fmt_num(msgs)} user msgs · {fmt_cost(cost)} spend · "
+        f"longest streak {stats['longest_streak']}d\n"
+        f"[dim]Active:[/dim] {stats['cur_streak']}-day current streak · "
+        f"{stats['n_projects']} project(s) · {stats['plan_turns']} plan turn(s)"
+    )
+    console.print(Panel(header, title="vibes", border_style="magenta"))
+
+    # ----- Achievements -----
+    unlocked = [(lbl, u) for lbl, u in achievements if u]
+    locked = [(lbl, u) for lbl, u in achievements if not u]
+    total = len(achievements)
+    if unlocked or locked:
+        ach = Table(title=f"Achievements ({len(unlocked)} / {total} unlocked)",
+                    box=box.SIMPLE, show_header=False, padding=(0, 2))
+        ach.add_column("a"); ach.add_column("b"); ach.add_column("c")
+        # Show unlocked first, then a few next-up locked ones.
+        cells = [f"[bold green]⬢[/bold green] {lbl}" for lbl, _ in unlocked]
+        cells += [f"[dim]○ {lbl}[/dim]" for lbl, _ in locked]
+        # Pack into rows of 3.
+        for i in range(0, len(cells), 3):
+            row = cells[i:i+3] + [""] * (3 - len(cells[i:i+3]))
+            ach.add_row(*row)
+        console.print(ach)
+
+    # ----- Traits -----
+    if msgs > 0:
+        t = Table(title="Traits", box=box.SIMPLE, show_header=False, padding=(0, 1))
+        t.add_column("Name", no_wrap=True)
+        t.add_column("Bar")
+        t.add_column("Value", justify="right", no_wrap=True)
+        t.add_column("Tag", justify="left", no_wrap=True)
+        bar_w = 16
+        for key, color in [("manners", "cyan"), ("composure", "green"), ("inquiry", "yellow")]:
+            val, label = traits[key]
+            display = min(1.0, val * 4) if key == "inquiry" else min(1.0, val * 10) if key == "manners" else val
+            filled = int(display * bar_w)
+            bar = f"[{color}]{'█' * filled}[/{color}]{'░' * (bar_w - filled)}"
+            t.add_row(key.title(), bar, f"{val*100:.1f}%", f"[dim]{label}[/dim]")
+        console.print(t)
+
+    # ----- Field notes -----
+    c = stats["counts"]
+    if msgs > 0:
+        fn = Table(title="Field notes (in user prompts)", box=box.SIMPLE, show_header=False, padding=(0, 2))
+        fn.add_column("k", no_wrap=True); fn.add_column("v", justify="right")
+        fn.add_column("k2", no_wrap=True); fn.add_column("v2", justify="right")
+        fn.add_row("Questions",   fmt_num(c["question"]),    "Courtesies",  fmt_num(c["courtesy"]))
+        fn.add_row("Caps Bursts", fmt_num(c["caps_burst"]),  "Confusions",  fmt_num(c["confusion"]))
+        fn.add_row("Celebrations",fmt_num(c["celebration"]), "Pastes (ch)", fmt_num(stats["paste_chars_total"]))
+        console.print(fn)
+
+    # ----- Heatmap -----
+    # Pick column count from terminal width: 6 chars label + 2 spaces + N cells.
+    avail = max(20, console.size.width - 10)
+    days = min(90, max(28, avail))
+    rows = _vibes_heatmap_rows(stats["day_msg_counts"], days=days)
+    if rows:
+        console.print(f"\n[bold]Activity heatmap[/bold]  "
+                      f"[dim](last {days} days, user messages/day)[/dim]")
+        for label, cells in rows:
+            console.print(f"  [dim]{label}[/dim]  {cells}")
+        console.print(f"  [dim]{' ' * 6}{_VIBE_HEAT_GLYPHS[0]} none   "
+                      f"{_VIBE_HEAT_GLYPHS[1]} light   "
+                      f"{_VIBE_HEAT_GLYPHS[2]} moderate   "
+                      f"{_VIBE_HEAT_GLYPHS[3]} busy   "
+                      f"{_VIBE_HEAT_GLYPHS[4]} peak[/dim]")
+
+    # ----- Arenas -----
+    top_arenas = sorted(stats["user_msg_by_project"].items(), key=lambda kv: -kv[1])[:5]
+    if top_arenas:
+        peak_n = top_arenas[0][1] or 1
+        ar = Table(title="Arenas (top projects by user-message volume)",
+                   box=box.SIMPLE, show_header=False, padding=(0, 1))
+        ar.add_column("#", no_wrap=True, justify="right")
+        ar.add_column("Project")
+        ar.add_column("Bar")
+        ar.add_column("Msgs", justify="right", no_wrap=True)
+        bar_w = 18
+        for i, (proj, n) in enumerate(top_arenas, 1):
+            label = shorten_path(decode_project(proj))
+            if len(label) > 40:
+                label = "…" + label[-37:]
+            filled = int(n / peak_n * bar_w)
+            ar.add_row(str(i), label,
+                       f"[magenta]{'█' * filled}[/magenta]{'░' * (bar_w - filled)}",
+                       fmt_num(n))
+        console.print(ar)
+
+    # ----- When you code -----
+    if stats["hour_msg_counts"]:
+        peak_hour = max(stats["hour_msg_counts"].items(), key=lambda kv: kv[1])[0]
+        peak_day_n = max(stats["weekday_counts"].items(), key=lambda kv: kv[1])[0] if stats["weekday_counts"] else 0
+        night_pct = stats["night_owl"] / msgs * 100 if msgs else 0
+        wknd_pct = stats["weekend"] / msgs * 100 if msgs else 0
+        body = (
+            f"Peak hour: [cyan]{peak_hour:02d}:00[/cyan]    "
+            f"Peak day: [cyan]{_WEEKDAY_ABBR[peak_day_n]}[/cyan]    "
+            f"Night-owl: [cyan]{night_pct:.0f}%[/cyan]    "
+            f"Weekend: [cyan]{wknd_pct:.0f}%[/cyan]"
+        )
+        console.print(Panel(body, title="When you code", border_style="cyan"))
+
+
+def cmd_vibes(args) -> None:
+    """Standalone entry point — same renderer as `summary --vibes`."""
+    if not RICH:
+        print("`vibes` requires `pip install rich`.", file=sys.stderr)
+        sys.exit(1)
+    records = load_records(args)
+    if not records:
+        print("No usage records found in", projects_root())
+        return
+    stats = collect_vibes_stats(records, projects_root())
+    if stats["user_msg_total"] == 0:
+        print("No user messages found in ~/.claude/projects/. Nothing to score yet.")
+        return
+    console = Console()
+    console.rule("[bold magenta]vibes[/bold magenta]")
+    _render_vibes(console, stats)
 
 
 # -------------------------------- CLI ---------------------------------- #
@@ -2699,8 +3626,13 @@ def main() -> None:
     common.add_argument("--last", metavar="DUR",
                         help="Shortcut for --since: e.g. 7d, 24h, 30m, 2w. Conflicts with --since.")
 
-    sub.add_parser("summary", parents=[common],
-                   help="Overall totals and per-model breakdown")
+    psum = sub.add_parser("summary", parents=[common],
+                          help="Overall totals and per-model breakdown")
+    psum.add_argument("--vibes", action="store_true",
+                      help="Append the vibes character sheet (achievements, traits, heatmap)")
+
+    sub.add_parser("vibes", parents=[common],
+                   help="Standalone vibes character sheet (achievements, traits, heatmap)")
 
     pd = sub.add_parser("daily", parents=[common], help="Daily usage breakdown")
     pd.add_argument("--days", type=int, default=14, help="How many days to show (default 14)")
@@ -2781,6 +3713,7 @@ def main() -> None:
     args = p.parse_args()
     handlers = {
         "summary":  cmd_summary,
+        "vibes":    cmd_vibes,
         "daily":    cmd_daily,
         "projects": cmd_projects,
         "sessions": cmd_sessions,

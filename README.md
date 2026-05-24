@@ -197,6 +197,44 @@ python monitor.py export --format csv -o usage.csv
 python monitor.py export --format csv --since 2026-04-01 --until 2026-04-30 -o april.csv
 ```
 
+## Subscription plan & recent activity
+
+`summary` and `budget` now read `~/.claude/.credentials.json` and display a
+plan banner:
+
+```
+Plan: Max 20x   · Rate tier: default_claude_max_20x   · Costs are API-equivalent — you pay a flat subscription fee.
+```
+
+For paid subscriptions (Pro / Max / Max 20x / Team / Enterprise) the banner
+flags that the dollar totals are *API-equivalent cost* — what the same usage
+would cost on the metered API. Your actual out-of-pocket spend is the flat
+subscription fee. For Free / unknown plans (or when credentials can't be
+read), the line is omitted.
+
+> **macOS note.** Claude Code stores credentials in the Keychain on macOS
+> (service `Claude Code-credentials`). The banner is not yet wired to read
+> the Keychain — macOS users will simply see no banner. Costs still display
+> normally.
+
+`summary` also prints a **Recent Activity** table with today vs. yesterday vs.
+30-day average, plus month-to-date and a linear projection of end-of-month
+spend at the current daily pace:
+
+```
+Today            $89.92   (672 calls)   (2.3× 30-day avg)
+Yesterday        $12.16   (84 calls)
+30-day avg       $39.65/day   (29 active days)
+MTD (May 2026)   $1,108.55   (day 24/31)
+Projected EOM    $1,431.87
+```
+
+`budget` shows the same projection as an extra row in the table and, when
+`--monthly USD` is set, treats the projection as a budget check — `PROJ OVER`
+status when the linear extrapolation exceeds the monthly cap. The projection
+also feeds into `--strict` exit codes, so a cron job can warn early if you're
+on pace to blow the month before you've actually hit the cap.
+
 ## Alerts
 
 `summary` and `report` print high-visibility banners above the suggestions
@@ -309,6 +347,7 @@ recommendations. The same output is appended to `report --format html` as an
 | `large-context` | Any single call ≥ 75% of its model's context cap (warn) or ≥ 90% (alert/high). Caps: 1M for Opus 4.6/4.7, 200K otherwise — see `CONTEXT_CAP` in [monitor.py](monitor.py) | `/clear` mid-session or split unrelated work. Tokens past the cap are billed but get summarized/dropped |
 | `expensive-single-call` | Session contains any single API call > $5. High severity when any call ≥ $10 | Investigate the peak call — usually a huge file paste, runaway tool loop, or Opus turn that pulled in a massive context |
 | `cache-cold-session` | Session ≥ 5 calls AND cost > $2 AND cache hit rate < 30% | Keep related work in one session; avoid mid-task `/clear`. Distinct from `low-cache-hit` (per-project) — this catches single cold sessions inside an otherwise-warm project |
+| `excessive-clear` | Session contains ≥ 3 `/clear` slash commands (≥ 5 = high severity) | Each `/clear` discards the prompt cache and forces the next turn to pay full cache-write rates. Read from `~/.claude/history.jsonl`. Savings estimated as `median_cache_rebuild_cost × (n_clears − 1)` |
 
 Rules 8, 9 and 10 check the project's `Read` file extensions against
 ast-graph's supported languages (Rust, Python, JS/TS, C#, Java) — the
@@ -336,6 +375,56 @@ in each JSONL entry (e.g. `claude-opus-4-6` matches the `claude-opus-4`
 entry). Unknown models fall back to Sonnet-equivalent pricing.
 
 Edit the dict if your rates differ (enterprise, batch tier, etc.).
+
+## Vibes (opt-in, for fun)
+
+A character-sheet view of your usage — class, level, achievements, traits, and
+a 90-day activity heatmap. Opt-in only:
+
+```bash
+python monitor.py vibes                # standalone
+python monitor.py summary --vibes      # appended to summary
+```
+
+Includes:
+
+- **Class** (`Strategist`, `Resonator`, `Heavy Lifter`, `Workhorse`,
+  `Sprinter`, `Cartographer`, `Marathoner`, `Quickfire`, `Generalist`) —
+  derived from your dominant usage pattern.
+- **Level** — a sqrt curve over `(user_msgs + 5 × dollars_spent)`, capped at 99.
+- **Achievements** — 24 milestones (`Initiate`, `Veteran`, `Lifer`, `Cup of
+  Coffee`, `Day's Pay`, `Mortgage Payment`, `Megaton`, `Gigaton`, `Cache
+  Whisperer`, `Cache Conjurer`, `Opus Devotee`, `Sonnet Loyalist`, `Polyglot`,
+  `Plan B`, `Insomniac`, `Sunrise Squad`, `Weekend Coder`, `Streak: Nd`,
+  `Marathoner`, `Tactful`, `Polite Codec`, `Inquisitor`, `Volume Pasteur`,
+  `First Drop`). Locked ones show as next-up challenges.
+- **Traits** — `Manners`, `Composure`, `Inquiry`, each scored from regex
+  counts on your user prompts.
+- **Field notes** — total questions, courtesies, caps-bursts, confusions,
+  celebrations.
+- **90-day activity heatmap** — weekday × day-of-window grid of user message
+  volume. Auto-adapts column count to your terminal width.
+- **Arenas** — top 5 projects by user-message volume.
+
+> **Privacy.** `vibes` reads user prompt text from
+> `~/.claude/projects/*/*.jsonl` *only to count regex matches in memory*. No
+> prompt text is ever retained or printed — only aggregate counts. The same
+> contract as the `excessive-clear` rule.
+
+## Data sources
+
+The monitor reads three local files written by Claude Code itself. Nothing
+leaves your machine.
+
+| Path | Used for | Privacy |
+|---|---|---|
+| `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` | Per-call usage, model, tools, plan-mode detection — the primary source | Read in full (it's already on disk) |
+| `~/.claude/.credentials.json` | Subscription tier banner (`Pro` / `Max` / `Max 20x` / `Team` / `Enterprise`). macOS Keychain not implemented yet — Mac users get no banner | Only `subscriptionType` and `rateLimitTier` are read; OAuth tokens are ignored |
+| `~/.claude/history.jsonl` | Slash-command histogram in `summary` and the `excessive-clear` rule | **Prompt text is never retained.** Only the slash command (first word after `/`), timestamps, session/project IDs, and total pasted-content character count are kept. Raw `display` strings are dropped at parse time |
+
+`summary` prints a "User Input (privacy-safe — counts only)" table summarising
+top slash commands and paste volume in the active time window. Inputs and
+their full text are never echoed.
 
 ## How it works
 
