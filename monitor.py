@@ -107,14 +107,23 @@ def context_cap(model: str) -> int:
     return DEFAULT_CONTEXT_CAP
 
 
-def projects_root() -> Path:
+_CLAUDE_DIR_OVERRIDE: Path | None = None
+
+
+def _claude_dir() -> Path:
+    """Resolve the .claude root, honoring the --claude-dir override if set."""
+    if _CLAUDE_DIR_OVERRIDE is not None:
+        return _CLAUDE_DIR_OVERRIDE
     home = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())
-    return home / ".claude" / "projects"
+    return home / ".claude"
+
+
+def projects_root() -> Path:
+    return _claude_dir() / "projects"
 
 
 def credentials_path() -> Path:
-    home = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())
-    return home / ".claude" / ".credentials.json"
+    return _claude_dir() / ".credentials.json"
 
 
 # Raw `subscriptionType` values seen in ~/.claude/.credentials.json mapped to
@@ -158,8 +167,7 @@ def is_subscription_user(info: dict | None) -> bool:
 
 
 def history_path() -> Path:
-    home = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())
-    return home / ".claude" / "history.jsonl"
+    return _claude_dir() / "history.jsonl"
 
 
 @dataclass
@@ -3614,6 +3622,12 @@ def main() -> None:
         description="Monitor Claude Code token usage and estimated costs.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("--claude-dir", metavar="DIR", default=None,
+                   help="Override the .claude root directory (default: ~/.claude). "
+                        "Must be placed BEFORE the subcommand, e.g. "
+                        "`monitor --claude-dir /path/to/.claude summary`. "
+                        "The directory should contain projects/, .credentials.json, "
+                        "and history.jsonl (any may be missing — features degrade gracefully).")
 
     # Common time-window flags shared by every aggregation command.
     # Not added to `live` (real-time by definition) or `budget` (computes its
@@ -3711,6 +3725,9 @@ def main() -> None:
                     help="Exit 1 if over limit, 2 if over warn threshold (for scripts)")
 
     args = p.parse_args()
+    if args.claude_dir:
+        global _CLAUDE_DIR_OVERRIDE
+        _CLAUDE_DIR_OVERRIDE = Path(args.claude_dir).expanduser().resolve()
     handlers = {
         "summary":  cmd_summary,
         "vibes":    cmd_vibes,
