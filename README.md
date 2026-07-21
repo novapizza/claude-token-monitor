@@ -105,13 +105,17 @@ to scope their output. See [Time-window filter](#time-window-filter) below.
 | `summary` | Grand totals and per-model breakdown (large-context alert pinned at top) |
 | `daily [--days N]` | Daily breakdown (default 14 days) |
 | `projects [--top N]` | Top projects by cost (default 20) |
-| `sessions [--top N]` | Top sessions by cost |
+| `sessions [--top N]` | Top sessions by cost (with AI-generated session titles) |
 | `weekly [--weeks N]` | Per-ISO-week totals (Mon–Sun buckets) |
 | `heatmap [--metric cost\|calls\|tokens]` | 7×24 day-of-week × hour heatmap (local time) |
 | `calendar [--year YYYY] [--metric cost\|calls]` | GitHub-style yearly activity grid |
 | `trend <project> [--days N]` | Daily trend for one project (substring match) |
 | `activity [--days N]` | Per-day unique sessions & projects active + top project of each day |
 | `cache [--top N]` | Cache hit rate + estimated savings per project |
+| `agents [--top N] [--project SUBSTR]` | Subagent delegation analytics: main-loop vs delegated token split, per-agent-type cost, savings vs Opus |
+| `memory [--detail]` | Per-project persistent-memory health: fact counts by type, size, staleness, MEMORY.md index integrity |
+| `disk [--top N]` | Disk footprint of the `.claude` directory by folder + largest session transcripts |
+| `plans` | List saved plan-mode plans in `~/.claude/plans` |
 | `suggest [--top N] [--min-savings USD]` | Detect inefficient usage patterns and suggest savings |
 | `budget [--daily \| --monthly \| --quarterly \| --yearly \| --rolling-30 \| --lifetime USD] [--warn-at 0.8] [--strict]` | Spend vs any combination of period limits |
 | `live [--interval S] [--budget-daily USD] [--context-warn N] [--context-alert N]` | Auto-refreshing dashboard with burn rate + active-session panel |

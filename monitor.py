@@ -12,6 +12,7 @@ import calendar as _calendar
 import csv
 import json
 import os
+import re as _re
 import sys
 import time
 from collections import defaultdict
@@ -42,12 +43,17 @@ except ImportError:  # graceful fallback
 # Order matters: most-specific prefix first (first substring match wins in model_price).
 # cw_5m = 5-minute cache write (1.25x input), cw_1h = 1-hour cache write (2x input).
 PRICING: dict[str, dict[str, float]] = {
+    "claude-fable-5":    {"in": 10.0, "out": 50.0, "cr": 1.00, "cw_5m": 12.50, "cw_1h": 20.0},
+    "claude-mythos-5":   {"in": 10.0, "out": 50.0, "cr": 1.00, "cw_5m": 12.50, "cw_1h": 20.0},
+    "claude-opus-4-8":   {"in":  5.0, "out": 25.0, "cr": 0.50, "cw_5m":  6.25, "cw_1h": 10.0},
     "claude-opus-4-7":   {"in":  5.0, "out": 25.0, "cr": 0.50, "cw_5m":  6.25, "cw_1h": 10.0},
     "claude-opus-4-6":   {"in":  5.0, "out": 25.0, "cr": 0.50, "cw_5m":  6.25, "cw_1h": 10.0},
     "claude-opus-4-5":   {"in":  5.0, "out": 25.0, "cr": 0.50, "cw_5m":  6.25, "cw_1h": 10.0},
     "claude-opus-4-1":   {"in": 15.0, "out": 75.0, "cr": 1.50, "cw_5m": 18.75, "cw_1h": 30.0},
     "claude-opus-4":     {"in": 15.0, "out": 75.0, "cr": 1.50, "cw_5m": 18.75, "cw_1h": 30.0},
+    "claude-sonnet-5":   {"in":  3.0, "out": 15.0, "cr": 0.30, "cw_5m":  3.75, "cw_1h":  6.0},
     "claude-sonnet-4":   {"in":  3.0, "out": 15.0, "cr": 0.30, "cw_5m":  3.75, "cw_1h":  6.0},
+    "claude-haiku-4-5":  {"in":  1.0, "out":  5.0, "cr": 0.10, "cw_5m":  1.25, "cw_1h":  2.0},
     "claude-haiku-4":    {"in":  1.0, "out":  5.0, "cr": 0.10, "cw_5m":  1.25, "cw_1h":  2.0},
     "claude-3-5-sonnet": {"in":  3.0, "out": 15.0, "cr": 0.30, "cw_5m":  3.75, "cw_1h":  6.0},
     "claude-3-5-haiku":  {"in":  0.8, "out":  4.0, "cr": 0.08, "cw_5m":  1.00, "cw_1h":  1.6},
@@ -93,8 +99,12 @@ def calc_cost(usage: dict, model: str) -> float:
 # 150K call on a 200K-cap model. Sonnet 4.x 1M-tier is plan-conditional and
 # not detectable from the model ID alone, so we keep it at the default.
 CONTEXT_CAP: dict[str, int] = {
+    "claude-fable-5":  1_000_000,
+    "claude-mythos-5": 1_000_000,
     "claude-opus-4-6": 1_000_000,
     "claude-opus-4-7": 1_000_000,
+    "claude-opus-4-8": 1_000_000,
+    "claude-sonnet-5": 1_000_000,
 }
 DEFAULT_CONTEXT_CAP = 200_000
 
@@ -521,6 +531,16 @@ def fmt_cost(c: float) -> str:
     return f"${c:.4f}"
 
 
+def fmt_bytes(n: int) -> str:
+    """Human-readable byte size (1 KB = 1024 B)."""
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024 or unit == "TB":
+            return f"{f:.0f} {unit}" if unit == "B" else f"{f:.1f} {unit}"
+        f /= 1024
+    return f"{f:.1f} TB"
+
+
 def load_all() -> list[Record]:
     return list(iter_records(projects_root()))
 
@@ -700,6 +720,285 @@ def collect_routing_stats(root: Path, project_filter: str | None = None) -> list
                     })
                 delegations.append(base)
     return delegations
+
+
+def collect_subagent_stats(root: Path, project_filter: str | None = None) -> list[dict]:
+    """Scan every spawned subagent across all sessions via its `.meta.json`.
+
+    Each spawned agent writes two files into
+    `projects/<proj>/<session>/subagents/`:
+      - `agent-<id>.jsonl`      — the transcript (assistant usage blocks)
+      - `agent-<id>.meta.json`  — {agentType, description, toolUseId, spawnDepth}
+
+    Unlike `collect_routing_stats` (which only finds `routine-worker` and links
+    by prompt fingerprint), this uses the meta file, so it covers ALL agent
+    types (Explore, Plan, general-purpose, …) with a reliable transcript link.
+
+    Returns one dict per subagent with keys: project, session_id, agent_id,
+    agent_type, description, spawn_depth, model, in/out/cr/cw, tokens,
+    cost_actual, cost_opus, saved, mtime.
+    """
+    out: list[dict] = []
+    if not root.exists():
+        return out
+    for project_dir in sorted(root.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        if project_filter:
+            q = project_filter.lower()
+            if (q not in decode_project(project_dir.name).lower()
+                    and q not in project_dir.name.lower()):
+                continue
+        for session_dir in project_dir.iterdir():
+            sub = session_dir / "subagents"
+            if not sub.is_dir():
+                continue
+            for meta_file in sorted(sub.glob("agent-*.meta.json")):
+                try:
+                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    meta = {}
+                agent_id = meta_file.name[: -len(".meta.json")]
+                transcript = sub / f"{agent_id}.jsonl"
+                if transcript.exists():
+                    u = _sum_subagent_usage(transcript)
+                else:
+                    u = {"in": 0, "out": 0, "cr": 0, "cw": 0,
+                         "cost_actual": 0.0, "cost_opus": 0.0, "model": ""}
+                try:
+                    mtime = meta_file.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                out.append({
+                    "project": project_dir.name,
+                    "session_id": session_dir.name,
+                    "agent_id": agent_id,
+                    "agent_type": meta.get("agentType") or "unknown",
+                    "description": (meta.get("description") or "").strip(),
+                    "spawn_depth": int(meta.get("spawnDepth") or 0),
+                    "model": u["model"],
+                    "in": u["in"], "out": u["out"], "cr": u["cr"], "cw": u["cw"],
+                    "tokens": u["in"] + u["out"] + u["cr"] + u["cw"],
+                    "cost_actual": u["cost_actual"],
+                    "cost_opus": u["cost_opus"],
+                    "saved": u["cost_opus"] - u["cost_actual"],
+                    "mtime": mtime,
+                })
+    return out
+
+
+# --------------------- .claude environment introspection -------------------- #
+
+
+def sessions_registry_root() -> Path:
+    return _claude_dir() / "sessions"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for a process id. Degrades to False on error."""
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            # Distinguish a live process from a signalled/exited one.
+            exit_code = ctypes.c_ulong()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            kernel32.CloseHandle(handle)
+            STILL_ACTIVE = 259
+            return bool(ok) and exit_code.value == STILL_ACTIVE
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+@dataclass
+class ActiveSession:
+    pid: int
+    session_id: str
+    cwd: str
+    started_at: int      # ms since epoch
+    version: str
+    kind: str
+    entrypoint: str
+    name: str
+    alive: bool
+
+
+def load_active_sessions() -> list[ActiveSession]:
+    """Read the `sessions/*.json` registry Claude Code writes per running session.
+
+    Each file is ground-truth for a session that was launched (pid, cwd,
+    version, entrypoint, human-readable name). We mark each `alive` via a pid
+    liveness check — stale files from crashed sessions are kept but flagged.
+    Empty list if the registry directory is absent.
+    """
+    root = sessions_registry_root()
+    out: list[ActiveSession] = []
+    if not root.exists():
+        return out
+    for f in root.glob("*.json"):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        pid = int(d.get("pid") or 0)
+        out.append(ActiveSession(
+            pid=pid,
+            session_id=str(d.get("sessionId") or ""),
+            cwd=str(d.get("cwd") or ""),
+            started_at=int(d.get("startedAt") or 0),
+            version=str(d.get("version") or ""),
+            kind=str(d.get("kind") or ""),
+            entrypoint=str(d.get("entrypoint") or ""),
+            name=str(d.get("name") or ""),
+            alive=_pid_alive(pid),
+        ))
+    return out
+
+
+def load_session_titles(root: Path) -> dict[str, str]:
+    """Map sessionId -> AI-generated conversation title.
+
+    Newer transcripts embed `{"type":"ai-title","aiTitle":"…","sessionId":"…"}`
+    records. We pre-filter lines by substring before JSON-parsing to keep the
+    full scan cheap. Empty dict if projects root is absent.
+    """
+    titles: dict[str, str] = {}
+    if not root.exists():
+        return titles
+    for project_dir in root.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for jsonl in project_dir.glob("*.jsonl"):
+            try:
+                f = jsonl.open("r", encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with f:
+                for line in f:
+                    if '"ai-title"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("type") != "ai-title":
+                        continue
+                    title = d.get("aiTitle")
+                    sid = str(d.get("sessionId") or jsonl.stem)
+                    if title:
+                        titles[sid] = str(title)
+    return titles
+
+
+_MEMORY_LINK_RE = _re.compile(r"\]\(([^)]+\.md)\)")
+
+
+def _parse_memory_frontmatter(text: str) -> dict:
+    """Extract the leading YAML-ish frontmatter (name/description/type) of a
+    memory fact file. Shallow parse — only top-level `key: value` lines between
+    the first two `---` fences. Returns {} if no frontmatter block."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    fm: dict[str, str] = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" in line and not line.startswith(" "):
+            key, _, val = line.partition(":")
+            fm[key.strip()] = val.strip()
+    return fm
+
+
+def collect_memory_stats(root: Path) -> list[dict]:
+    """Per-project persistent-memory stats from `projects/<proj>/memory/`.
+
+    Memory is durable account state (independent of any session). We read only
+    metadata + the one-line `description` frontmatter (never fact bodies).
+    Reports counts, type breakdown, size, staleness, and index integrity
+    (MEMORY.md links pointing at missing files, and fact files absent from the
+    index). Empty list if projects root is absent.
+    """
+    out: list[dict] = []
+    if not root.exists():
+        return out
+    for project_dir in sorted(root.iterdir()):
+        mem = project_dir / "memory"
+        if not mem.is_dir():
+            continue
+        facts: list[dict] = []
+        indexed: set[str] = set()
+        total_size = 0
+        last_mtime = 0.0
+        for md in mem.glob("*.md"):
+            try:
+                st = md.stat()
+            except OSError:
+                continue
+            total_size += st.st_size
+            last_mtime = max(last_mtime, st.st_mtime)
+            if md.name == "MEMORY.md":
+                try:
+                    idx_text = md.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    idx_text = ""
+                indexed = {m.group(1) for m in _MEMORY_LINK_RE.finditer(idx_text)}
+                continue
+            try:
+                text = md.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            fm = _parse_memory_frontmatter(text)
+            facts.append({
+                "file": md.name,
+                "type": (fm.get("type") or "").lower() or "unknown",
+                "description": fm.get("description") or "",
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+            })
+        by_type: dict[str, int] = defaultdict(int)
+        for fct in facts:
+            by_type[fct["type"]] += 1
+        fact_files = {fct["file"] for fct in facts}
+        missing = sorted(indexed - fact_files)          # linked but absent
+        unindexed = sorted(fact_files - indexed)        # present but unlinked
+        out.append({
+            "project": project_dir.name,
+            "count": len(facts),
+            "by_type": dict(by_type),
+            "total_size": total_size,
+            "last_mtime": last_mtime,
+            "has_index": bool(indexed),
+            "missing": missing,
+            "unindexed": unindexed,
+            "facts": facts,
+        })
+    return out
+
+
+def _dir_size(path: Path) -> tuple[int, int]:
+    """Recursive (total_bytes, file_count) for a directory. Skips unreadable entries."""
+    total = 0
+    n = 0
+    try:
+        for p in path.rglob("*"):
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+                    n += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total, n
 
 
 # ------------------------------- Commands ------------------------------- #
@@ -1009,19 +1308,24 @@ def cmd_sessions(args) -> None:
 
     console = Console() if RICH else None
     rows = sorted(by_session.items(), key=lambda kv: -kv[1]["cost"])[: args.top]
+    titles = load_session_titles(projects_root())
     if not RICH:
         for sess, a in rows:
-            print(f"{sess[:8]}...  calls={a['calls']:4d}  cost={fmt_cost(a['cost'])}")
+            title = titles.get(sess, "")
+            label = f"  {title}" if title else ""
+            print(f"{sess[:8]}...  calls={a['calls']:4d}  cost={fmt_cost(a['cost'])}{label}")
         return
 
     t = Table(title=f"Top {args.top} Sessions by Cost", box=box.SIMPLE_HEAVY)
-    t.add_column("Session"); t.add_column("Calls", justify="right")
+    t.add_column("Session"); t.add_column("Title", max_width=40, overflow="ellipsis")
+    t.add_column("Calls", justify="right")
     t.add_column("Input", justify="right"); t.add_column("Output", justify="right")
     t.add_column("Cache R", justify="right"); t.add_column("Cache W", justify="right")
     t.add_column("Cost", justify="right"); t.add_column("Last active", justify="right")
     for sess, a in rows:
         last = a["last"].strftime("%Y-%m-%d %H:%M") if a["last"] else "-"
-        t.add_row(sess[:8] + "...", str(a["calls"]),
+        title = titles.get(sess, "") or "[dim]—[/dim]"
+        t.add_row(sess[:8] + "...", title, str(a["calls"]),
                   fmt_num(a["in"]), fmt_num(a["out"]),
                   fmt_num(a["cr"]), fmt_num(a["cw"]),
                   fmt_cost(a["cost"]), last)
@@ -1176,6 +1480,30 @@ def cmd_live(args) -> None:
                     f"(idle — no spend in last 30m)"
                 )
 
+        # ---------- live-session registry (ground truth from sessions/*.json) ----------
+        reg = {s.session_id: s for s in load_active_sessions()}
+        alive = [s for s in reg.values() if s.alive]
+        reg_panel = None
+        if alive:
+            rt = Table(box=box.MINIMAL, show_header=True, header_style="bold",
+                       title=f"Live sessions ({len(alive)} running)")
+            rt.add_column("Session", no_wrap=True)
+            rt.add_column("Name", overflow="ellipsis", max_width=22)
+            rt.add_column("Via", no_wrap=True)
+            rt.add_column("Project", style="cyan", max_width=30, overflow="ellipsis")
+            rt.add_column("Uptime", justify="right")
+            rt.add_column("Ver", no_wrap=True)
+            for s in sorted(alive, key=lambda x: -x.started_at):
+                if s.started_at:
+                    up_s = max(0, now.timestamp() - s.started_at / 1000.0)
+                    uptime = (f"{int(up_s // 3600)}h{int((up_s % 3600) // 60)}m"
+                              if up_s >= 3600 else f"{int(up_s // 60)}m")
+                else:
+                    uptime = "-"
+                rt.add_row(s.session_id[:8] + "…", s.name or "-", s.entrypoint or "-",
+                           shorten_path(s.cwd), uptime, s.version or "-")
+            reg_panel = rt
+
         # ---------- active session panel (records in last 10 min) ----------
         cutoff_10m = now - timedelta(minutes=10)
         active = [
@@ -1185,6 +1513,7 @@ def cmd_live(args) -> None:
         if active:
             latest = max(active, key=lambda r: parse_ts(r.timestamp))
             cur_session = latest.session_id
+            reg_cur = reg.get(cur_session)
             cur_recs = [r for r in records if r.session_id == cur_session]
             ctx_values = [_ctx_tokens(r) for r in cur_recs]
             peak_ctx = max(ctx_values) if ctx_values else 0
@@ -1211,7 +1540,15 @@ def cmd_live(args) -> None:
                 ctx_warn = ""
 
             ts_latest = parse_ts(latest.timestamp).astimezone().strftime("%H:%M:%S")
+            name_line = ""
+            if reg_cur:
+                live_tag = "[green]● live[/green]" if reg_cur.alive else "[dim]○ ended[/dim]"
+                name_line = (
+                    f"[bold]Name:[/bold] {reg_cur.name or '—'}   "
+                    f"[bold]Via:[/bold] {reg_cur.entrypoint or '—'}   {live_tag}\n"
+                )
             session_body = (
+                f"{name_line}"
                 f"[bold]Session:[/bold] {cur_session[:8]}…   "
                 f"[bold]Project:[/bold] {cur_proj}\n"
                 f"[bold]Model:[/bold] {latest.model}   "
@@ -1226,12 +1563,18 @@ def cmd_live(args) -> None:
                 session_body, title="Active Session (last 10 min)",
                 border_style=border,
             )
-            return Group(t, burn_line, session_panel)
+            parts = [t, burn_line, session_panel]
+            if reg_panel is not None:
+                parts.append(reg_panel)
+            return Group(*parts)
 
-        return Group(
+        parts = [
             t, burn_line,
             "[dim]No activity in the last 10 minutes — waiting for a Claude Code session…[/dim]",
-        )
+        ]
+        if reg_panel is not None:
+            parts.append(reg_panel)
+        return Group(*parts)
 
     with Live(render(), refresh_per_second=2, console=console, screen=False) as live:
         try:
@@ -1879,6 +2222,104 @@ def cmd_report(args) -> None:
                 "Only counts delegations whose subagent transcript could be linked "
                 "by prompt fingerprint; unmatched rows show '—'.[/dim]"
             )
+
+        # Section 6b: subagent delegations across ALL agent types (via .meta.json)
+        subs = collect_subagent_stats(projects_root(), project_filter)
+        if subs:
+            console.print()
+            console.rule("[bold]Subagent Delegations — all agent types[/bold]")
+            deleg_tokens = sum(s["tokens"] for s in subs)
+            deleg_cost = sum(s["cost_actual"] for s in subs)
+            total_saved = sum(s["saved"] for s in subs)
+            grand = grand_tokens if (grand_tokens := sum(
+                r.usage.get("input_tokens", 0) + r.usage.get("output_tokens", 0)
+                + r.usage.get("cache_read_input_tokens", 0)
+                + r.usage.get("cache_creation_input_tokens", 0) for r in records
+            )) else 0
+            share = (deleg_tokens / (grand + deleg_tokens) * 100) if (grand + deleg_tokens) else 0.0
+            by_type: dict[str, dict] = defaultdict(
+                lambda: {"n": 0, "tokens": 0, "cost": 0.0, "saved": 0.0})
+            for s in subs:
+                a = by_type[s["agent_type"]]
+                a["n"] += 1
+                a["tokens"] += s["tokens"]
+                a["cost"] += s["cost_actual"]
+                a["saved"] += s["saved"]
+            st = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+            st.add_column("Agent type"); st.add_column("Count", justify="right")
+            st.add_column("Tokens", justify="right"); st.add_column("Cost", justify="right")
+            st.add_column("Saved vs Opus", justify="right")
+            for typ, a in sorted(by_type.items(), key=lambda kv: -kv[1]["cost"]):
+                st.add_row(typ, str(a["n"]), fmt_num(a["tokens"]),
+                           fmt_cost(a["cost"]), f"[green]{fmt_cost(a['saved'])}[/green]")
+            console.print(st)
+            console.print(
+                f"[bold]{len(subs)}[/bold] delegations · "
+                f"[cyan]{fmt_num(deleg_tokens)}[/cyan] delegated tokens "
+                f"([cyan]{share:.1f}%[/cyan] of all tokens) · "
+                f"cost [cyan]{fmt_cost(deleg_cost)}[/cyan] · "
+                f"[green]saved vs Opus {fmt_cost(total_saved)}[/green]"
+            )
+
+        # Section 6c: persistent memory health
+        mem_stats = [m for m in collect_memory_stats(projects_root())
+                     if m["count"] or m["has_index"]]
+        if mem_stats:
+            console.print()
+            console.rule("[bold]Persistent Memory[/bold]")
+            mt = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+            mt.add_column("Project", style="cyan", max_width=34, overflow="ellipsis")
+            mt.add_column("Facts", justify="right")
+            mt.add_column("Types")
+            mt.add_column("Size", justify="right")
+            mt.add_column("Integrity")
+            for m in sorted(mem_stats, key=lambda x: -x["count"]):
+                proj = shorten_path(decode_project(m["project"]))
+                types = "  ".join(f"[dim]{k}[/dim] {v}"
+                                  for k, v in sorted(m["by_type"].items()))
+                probs = []
+                if m["missing"]:
+                    probs.append(f"[red]{len(m['missing'])} missing[/red]")
+                if m["unindexed"]:
+                    probs.append(f"[yellow]{len(m['unindexed'])} unindexed[/yellow]")
+                if not m["has_index"]:
+                    probs.append("[yellow]no MEMORY.md[/yellow]")
+                mt.add_row(proj, str(m["count"]), types or "[dim]-[/dim]",
+                           fmt_bytes(m["total_size"]),
+                           "  ".join(probs) if probs else "[green]ok[/green]")
+            console.print(mt)
+            console.print(f"[dim]{sum(m['count'] for m in mem_stats)} facts across "
+                          f"{len(mem_stats)} project(s) — durable across sessions.[/dim]")
+
+        # Section 6d: .claude disk footprint
+        claude_root = _claude_dir()
+        if claude_root.exists():
+            disk_entries: list[tuple[str, int, int]] = []
+            try:
+                for child in sorted(claude_root.iterdir()):
+                    if child.is_dir():
+                        size, n = _dir_size(child)
+                        disk_entries.append((child.name + "/", size, n))
+                    elif child.is_file():
+                        disk_entries.append((child.name, child.stat().st_size, 1))
+            except OSError:
+                disk_entries = []
+            if disk_entries:
+                disk_entries.sort(key=lambda e: -e[1])
+                disk_total = sum(e[1] for e in disk_entries)
+                console.print()
+                console.rule("[bold].claude Disk Usage[/bold]")
+                dt = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+                dt.add_column("Folder / file", style="cyan")
+                dt.add_column("Size", justify="right")
+                dt.add_column("Files", justify="right")
+                dt.add_column("Share", justify="right")
+                for name, size, n in disk_entries[:12]:
+                    pctv = (size / disk_total * 100) if disk_total else 0.0
+                    dt.add_row(name, fmt_bytes(size), str(n),
+                               f"[dim]{'█' * int(pctv / 5)}[/dim] {pctv:.0f}%")
+                console.print(dt)
+                console.print(f"[bold]Total:[/bold] [green]{fmt_bytes(disk_total)}[/green]")
 
         # Section 7: suggestions (with large-context alert pinned above)
         console.print()
@@ -3613,6 +4054,336 @@ def cmd_vibes(args) -> None:
     _render_vibes(console, stats)
 
 
+def cmd_agents(args) -> None:
+    """Subagent delegation analytics across all sessions (via .meta.json)."""
+    project_filter = getattr(args, "project", None)
+    subs = collect_subagent_stats(projects_root(), project_filter)
+    # Apply the shared time window using each subagent's meta mtime.
+    since, until = parse_window(args)
+    if since is not None or until is not None:
+        kept = []
+        for s in subs:
+            if s["mtime"] <= 0:
+                continue
+            ts = datetime.fromtimestamp(s["mtime"]).astimezone()
+            if since is not None and ts < since:
+                continue
+            if until is not None and ts >= until:
+                continue
+            kept.append(s)
+        subs = kept
+
+    if not subs:
+        print("No subagent delegations found under", projects_root())
+        return
+
+    # Delegated (subagent) vs main-loop token split. Subagent transcripts live
+    # in per-session subdirs, so load_all() (top-level *.jsonl only) is the
+    # main-loop side and never double-counts them.
+    main_records = filter_records(load_all(), args)
+    if project_filter:
+        q = project_filter.lower()
+        main_records = [r for r in main_records
+                        if q in decode_project(r.project).lower() or q in r.project.lower()]
+    main_tokens = sum(
+        int(r.usage.get("input_tokens") or 0)
+        + int(r.usage.get("output_tokens") or 0)
+        + int(r.usage.get("cache_read_input_tokens") or 0)
+        + int(r.usage.get("cache_creation_input_tokens") or 0)
+        for r in main_records
+    )
+    main_cost = sum(r.cost for r in main_records)
+    deleg_tokens = sum(s["tokens"] for s in subs)
+    deleg_cost = sum(s["cost_actual"] for s in subs)
+    total_saved = sum(s["saved"] for s in subs)
+    nested = [s for s in subs if s["spawn_depth"] > 1]
+
+    by_type: dict[str, dict] = defaultdict(
+        lambda: {"n": 0, "tokens": 0, "cost": 0.0, "saved": 0.0})
+    for s in subs:
+        a = by_type[s["agent_type"]]
+        a["n"] += 1
+        a["tokens"] += s["tokens"]
+        a["cost"] += s["cost_actual"]
+        a["saved"] += s["saved"]
+
+    if not RICH:
+        print(f"Subagents: {len(subs)}   delegated tokens: {fmt_num(deleg_tokens)}   "
+              f"cost: {fmt_cost(deleg_cost)}")
+        grand = main_tokens + deleg_tokens
+        share = (deleg_tokens / grand * 100) if grand else 0.0
+        print(f"Main-loop tokens: {fmt_num(main_tokens)}   "
+              f"delegated share: {share:.1f}%   est. saved vs Opus: {fmt_cost(total_saved)}")
+        for t, a in sorted(by_type.items(), key=lambda kv: -kv[1]["cost"]):
+            print(f"  {t:16s} n={a['n']:3d}  tokens={fmt_num(a['tokens']):>8s}  "
+                  f"cost={fmt_cost(a['cost'])}  saved={fmt_cost(a['saved'])}")
+        return
+
+    console = Console()
+    console.rule("[bold]Subagent Delegations[/bold]")
+
+    grand = main_tokens + deleg_tokens
+    share = (deleg_tokens / grand * 100) if grand else 0.0
+    split = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+    split.add_column("Scope"); split.add_column("Tokens", justify="right")
+    split.add_column("Cost", justify="right"); split.add_column("Share", justify="right")
+    split.add_row("Main loop", fmt_num(main_tokens), fmt_cost(main_cost),
+                  f"{100 - share:.1f}%")
+    split.add_row("[cyan]Delegated[/cyan]", f"[cyan]{fmt_num(deleg_tokens)}[/cyan]",
+                  f"[cyan]{fmt_cost(deleg_cost)}[/cyan]", f"[cyan]{share:.1f}%[/cyan]")
+    console.print(split)
+    console.print(
+        f"[bold]Subagents:[/bold] {len(subs)}   "
+        f"[bold]nested (depth>1):[/bold] {len(nested)}   "
+        f"[bold green]est. saved vs Opus:[/bold green] {fmt_cost(total_saved)}"
+    )
+
+    t = Table(title="By Agent Type", box=box.SIMPLE_HEAVY)
+    t.add_column("Agent type"); t.add_column("Count", justify="right")
+    t.add_column("Tokens", justify="right"); t.add_column("Cost", justify="right")
+    t.add_column("Saved vs Opus", justify="right")
+    for typ, a in sorted(by_type.items(), key=lambda kv: -kv[1]["cost"]):
+        t.add_row(typ, str(a["n"]), fmt_num(a["tokens"]),
+                  fmt_cost(a["cost"]), f"[green]{fmt_cost(a['saved'])}[/green]")
+    console.print(t)
+
+    recent = sorted(subs, key=lambda s: s["mtime"], reverse=True)[: args.top]
+    d = Table(title=f"Recent delegations (top {len(recent)})", box=box.SIMPLE_HEAVY)
+    d.add_column("When", style="dim", no_wrap=True)
+    d.add_column("Type", style="magenta", no_wrap=True)
+    d.add_column("Project", style="cyan", max_width=20, overflow="ellipsis")
+    d.add_column("Description", overflow="ellipsis", max_width=40)
+    d.add_column("Model", no_wrap=True)
+    d.add_column("Tokens", justify="right")
+    d.add_column("Cost", justify="right")
+    for s in recent:
+        when = (datetime.fromtimestamp(s["mtime"]).astimezone().strftime("%m-%d %H:%M")
+                if s["mtime"] else "?")
+        proj = decode_project(s["project"])
+        proj_short = proj.rsplit("/", 1)[-1] if "/" in proj else proj
+        model = (s["model"] or "-").replace("claude-", "")
+        depth = f" [dim]d{s['spawn_depth']}[/dim]" if s["spawn_depth"] > 1 else ""
+        d.add_row(when, s["agent_type"] + depth, proj_short,
+                  s["description"] or "[dim](none)[/dim]", model,
+                  fmt_num(s["tokens"]), fmt_cost(s["cost_actual"]))
+    console.print(d)
+    console.print(
+        "[dim]Delegated tokens run in isolated subagent contexts (kept out of "
+        "the main conversation). 'Saved vs Opus' = tokens × Opus price − actual "
+        "cost at the subagent's model. Directional only.[/dim]"
+    )
+
+
+def cmd_memory(args) -> None:
+    """Per-project persistent-memory health (counts, types, staleness, integrity)."""
+    stats = collect_memory_stats(projects_root())
+    if not stats:
+        print("No memory directories found under", projects_root())
+        return
+    stats = [s for s in stats if s["count"] or s["has_index"]]
+    if not stats:
+        print("No memory facts recorded yet.")
+        return
+    show_detail = getattr(args, "detail", False)
+    now = time.time()
+
+    if not RICH:
+        for s in sorted(stats, key=lambda x: -x["count"]):
+            proj = shorten_path(decode_project(s["project"]))
+            types = " ".join(f"{k}:{v}" for k, v in sorted(s["by_type"].items()))
+            print(f"{proj}\n  facts={s['count']}  {types}  size={fmt_bytes(s['total_size'])}")
+            if s["missing"]:
+                print(f"  ! index links to missing: {', '.join(s['missing'])}")
+            if s["unindexed"]:
+                print(f"  ! not in index: {', '.join(s['unindexed'])}")
+        return
+
+    console = Console()
+    console.rule("[bold]Persistent Memory[/bold]")
+    total_facts = sum(s["count"] for s in stats)
+    total_size = sum(s["total_size"] for s in stats)
+    console.print(
+        f"[bold]{total_facts}[/bold] facts across [bold]{len(stats)}[/bold] "
+        f"project(s)   [dim]({fmt_bytes(total_size)} on disk)[/dim]   "
+        "[dim]memory is durable across sessions[/dim]"
+    )
+
+    t = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+    t.add_column("Project", style="cyan", max_width=34, overflow="ellipsis")
+    t.add_column("Facts", justify="right")
+    t.add_column("Types")
+    t.add_column("Size", justify="right")
+    t.add_column("Updated", justify="right")
+    t.add_column("Integrity")
+    for s in sorted(stats, key=lambda x: -x["count"]):
+        proj = shorten_path(decode_project(s["project"]))
+        types = "  ".join(f"[dim]{k}[/dim] {v}" for k, v in sorted(s["by_type"].items()))
+        if s["last_mtime"]:
+            age_days = (now - s["last_mtime"]) / 86400
+            updated = "today" if age_days < 1 else f"{int(age_days)}d ago"
+            if age_days > 30:
+                updated = f"[yellow]{updated}[/yellow]"
+        else:
+            updated = "-"
+        problems = []
+        if s["missing"]:
+            problems.append(f"[red]{len(s['missing'])} missing[/red]")
+        if s["unindexed"]:
+            problems.append(f"[yellow]{len(s['unindexed'])} unindexed[/yellow]")
+        if not s["has_index"]:
+            problems.append("[yellow]no MEMORY.md[/yellow]")
+        integrity = "  ".join(problems) if problems else "[green]ok[/green]"
+        t.add_row(proj, str(s["count"]), types or "[dim]-[/dim]",
+                  fmt_bytes(s["total_size"]), updated, integrity)
+    console.print(t)
+
+    # Integrity detail — always name the offending files (metadata, not content).
+    for s in stats:
+        if s["missing"] or s["unindexed"]:
+            proj = shorten_path(decode_project(s["project"]))
+            console.print(f"[bold]{proj}[/bold]")
+            for f in s["missing"]:
+                console.print(f"  [red]· index links to missing file:[/red] {f}")
+            for f in s["unindexed"]:
+                console.print(f"  [yellow]· fact file not in MEMORY.md:[/yellow] {f}")
+
+    if show_detail:
+        for s in sorted(stats, key=lambda x: -x["count"]):
+            if not s["facts"]:
+                continue
+            proj = shorten_path(decode_project(s["project"]))
+            dt = Table(title=f"Facts — {proj}", box=box.MINIMAL, show_header=True)
+            dt.add_column("Type", style="magenta", no_wrap=True)
+            dt.add_column("File", style="dim", no_wrap=True)
+            dt.add_column("Description")
+            for fct in sorted(s["facts"], key=lambda x: x["type"]):
+                dt.add_row(fct["type"], fct["file"],
+                           fct["description"] or "[dim](no description)[/dim]")
+            console.print(dt)
+    else:
+        console.print("[dim]Pass --detail to list each fact's description "
+                      "(metadata only — never fact bodies).[/dim]")
+
+
+def cmd_disk(args) -> None:
+    """Disk footprint of the .claude directory, by top-level folder."""
+    root = _claude_dir()
+    if not root.exists():
+        print("No .claude directory at", root)
+        return
+
+    entries: list[tuple[str, int, int]] = []
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        children = []
+    for child in children:
+        try:
+            if child.is_dir():
+                size, n = _dir_size(child)
+                entries.append((child.name + "/", size, n))
+            elif child.is_file():
+                entries.append((child.name, child.stat().st_size, 1))
+        except OSError:
+            continue
+    entries.sort(key=lambda e: -e[1])
+    grand_size = sum(e[1] for e in entries)
+    grand_files = sum(e[2] for e in entries)
+
+    if not RICH:
+        print(f".claude total: {fmt_bytes(grand_size)} in {grand_files} files ({root})")
+        for name, size, n in entries:
+            print(f"  {name:24s} {fmt_bytes(size):>10s}  {n:>6d} files")
+        return
+
+    console = Console()
+    console.rule(f"[bold].claude disk usage[/bold]  [dim]{shorten_path(str(root))}[/dim]")
+    t = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+    t.add_column("Folder / file", style="cyan")
+    t.add_column("Size", justify="right")
+    t.add_column("Files", justify="right")
+    t.add_column("Share", justify="right")
+    for name, size, n in entries:
+        share = (size / grand_size * 100) if grand_size else 0.0
+        bar = "█" * int(share / 5)
+        t.add_row(name, fmt_bytes(size), str(n), f"[dim]{bar}[/dim] {share:.0f}%")
+    console.print(t)
+    console.print(f"[bold]Total:[/bold] [green]{fmt_bytes(grand_size)}[/green] "
+                  f"in {grand_files} files")
+
+    # Top sessions by transcript size (the usual growth driver).
+    proot = projects_root()
+    sess_sizes: list[tuple[str, str, int]] = []
+    if proot.exists():
+        for project_dir in proot.iterdir():
+            if not project_dir.is_dir():
+                continue
+            for jsonl in project_dir.glob("*.jsonl"):
+                try:
+                    sess_sizes.append(
+                        (project_dir.name, jsonl.stem, jsonl.stat().st_size))
+                except OSError:
+                    continue
+    if sess_sizes:
+        sess_sizes.sort(key=lambda e: -e[2])
+        st = Table(title="Largest session transcripts", box=box.SIMPLE_HEAVY)
+        st.add_column("Session", no_wrap=True)
+        st.add_column("Project", style="cyan", max_width=34, overflow="ellipsis")
+        st.add_column("Size", justify="right")
+        for proj, sess, size in sess_sizes[: args.top]:
+            st.add_row(sess[:8] + "…", shorten_path(decode_project(proj)), fmt_bytes(size))
+        console.print(st)
+
+
+def cmd_plans(args) -> None:
+    """List saved plan-mode plans in ~/.claude/plans."""
+    d = _claude_dir() / "plans"
+    if not d.exists():
+        print("No plans directory at", d)
+        return
+    plans = []
+    for md in d.glob("*.md"):
+        try:
+            st = md.stat()
+        except OSError:
+            continue
+        title = ""
+        try:
+            with md.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("#"):
+                        title = line.lstrip("#").strip()
+                        break
+        except OSError:
+            pass
+        plans.append({"file": md.name, "title": title or md.stem,
+                      "size": st.st_size, "mtime": st.st_mtime})
+    if not plans:
+        print("No saved plans found in", d)
+        return
+    plans.sort(key=lambda p: -p["mtime"])
+    now = time.time()
+
+    if not RICH:
+        for p in plans:
+            age = (now - p["mtime"]) / 86400
+            print(f"{p['title'][:60]:60s}  {fmt_bytes(p['size']):>8s}  {int(age)}d ago")
+        return
+
+    console = Console()
+    console.rule(f"[bold]Saved Plans[/bold]  [dim]({len(plans)})[/dim]")
+    t = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+    t.add_column("Title", overflow="ellipsis", max_width=60)
+    t.add_column("File", style="dim", no_wrap=True, overflow="ellipsis", max_width=30)
+    t.add_column("Size", justify="right")
+    t.add_column("Saved", justify="right")
+    for p in plans:
+        age_days = (now - p["mtime"]) / 86400
+        saved = "today" if age_days < 1 else f"{int(age_days)}d ago"
+        t.add_row(p["title"], p["file"], fmt_bytes(p["size"]), saved)
+    console.print(t)
+
+
 # -------------------------------- CLI ---------------------------------- #
 
 
@@ -3710,6 +4481,23 @@ def main() -> None:
     psg.add_argument("--min-savings", type=float, default=0.0,
                      help="Hide quantified suggestions with est. savings below $X")
 
+    pag = sub.add_parser("agents", parents=[common],
+                         help="Subagent delegation analytics (by agent type, cost, savings)")
+    pag.add_argument("--top", type=int, default=15,
+                     help="Max recent delegations to show (default 15)")
+    pag.add_argument("--project", help="Filter to one project (substring match)")
+
+    pm = sub.add_parser("memory",
+                        help="Persistent-memory health across projects (counts, staleness, integrity)")
+    pm.add_argument("--detail", action="store_true",
+                    help="List each fact's one-line description (metadata only)")
+
+    pdk = sub.add_parser("disk", help="Disk footprint of the .claude directory by folder")
+    pdk.add_argument("--top", type=int, default=15,
+                     help="Max largest session transcripts to show (default 15)")
+
+    sub.add_parser("plans", help="List saved plan-mode plans in ~/.claude/plans")
+
     pb = sub.add_parser("budget",
                         help="Check spend vs daily/monthly/quarterly/yearly/rolling/lifetime limits")
     pb.add_argument("--daily", type=float, help="Daily budget in USD, e.g. 10")
@@ -3744,6 +4532,10 @@ def main() -> None:
         "cache":    cmd_cache,
         "report":   cmd_report,
         "suggest":  cmd_suggest,
+        "agents":   cmd_agents,
+        "memory":   cmd_memory,
+        "disk":     cmd_disk,
+        "plans":    cmd_plans,
         "budget":   cmd_budget,
     }
     handlers[args.cmd](args)
