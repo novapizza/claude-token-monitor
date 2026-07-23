@@ -621,5 +621,240 @@ class FullPipelineSmokeTest(unittest.TestCase):
                           f"expected opus-routine-session suggestion, got {rules}")
 
 
+def _mk_rec(sess: str = "S1", msg_id: str = "m1", cost: float = 0.5,
+            model: str = "claude-sonnet-4-6", **kw) -> "monitor.Record":
+    """Bare Record for rule tests that don't need the JSONL pipeline."""
+    usage = kw.pop("usage", {"input_tokens": 1_000, "output_tokens": 200,
+                             "cache_read_input_tokens": 0,
+                             "cache_creation_input_tokens": 0})
+    return monitor.Record(
+        project="c--Users-u-proj", session_id=sess,
+        timestamp="2026-04-15T12:00:00.000Z", model=model,
+        usage=usage, cost=cost, cwd="/home/u/code/proj", msg_id=msg_id, **kw)
+
+
+class ServerToolCostTest(unittest.TestCase):
+    def test_web_search_requests_billed_per_1k(self):
+        usage = {"input_tokens": 0, "output_tokens": 0,
+                 "server_tool_use": {"web_search_requests": 100}}
+        # 100 searches @ $10/1K = $1
+        self.assertAlmostEqual(monitor.calc_cost(usage, "claude-sonnet-4-6"),
+                               1.0, places=6)
+
+    def test_absent_server_tool_use_is_free(self):
+        usage = {"input_tokens": 1_000_000, "output_tokens": 0,
+                 "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        self.assertAlmostEqual(monitor.calc_cost(usage, "claude-sonnet-4-6"),
+                               3.0, places=6)
+
+
+class NewFieldExtractionTest(unittest.TestCase):
+    """iter_records must surface stop_reason, effort, promptId,
+    attributionSkill, cache-miss diagnostics and web search counts."""
+
+    def test_assistant_extras_extracted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            e = _assistant_event(session_id="S1", msg_id="m1",
+                                 timestamp="2026-04-15T12:00:00.000Z")
+            e["effort"] = "high"
+            e["promptId"] = "p-123"
+            e["attributionSkill"] = "security-review"
+            e["isApiErrorMessage"] = True
+            e["message"]["stop_reason"] = "max_tokens"
+            e["message"]["diagnostics"] = {
+                "cache_miss_reason": {"type": "tools_changed",
+                                      "cache_missed_input_tokens": 30_000},
+            }
+            e["message"]["usage"]["server_tool_use"] = {"web_search_requests": 4}
+            _write_session(root / "p1", "S1", [e])
+
+            r = list(monitor.iter_records(root))[0]
+            self.assertEqual(r.stop_reason, "max_tokens")
+            self.assertEqual(r.effort, "high")
+            self.assertEqual(r.prompt_id, "p-123")
+            self.assertEqual(r.skill, "security-review")
+            self.assertTrue(r.api_error)
+            self.assertEqual(r.cache_miss_reason, "tools_changed")
+            self.assertEqual(r.cache_missed_tokens, 30_000)
+            self.assertEqual(r.web_searches, 4)
+
+    def test_stop_reason_backfilled_from_final_chunk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ts = "2026-04-15T12:00:00.000Z"
+            first = _assistant_event(session_id="S1", msg_id="m1", timestamp=ts)
+            first["message"]["stop_reason"] = None
+            last = _assistant_event(session_id="S1", msg_id="m1", timestamp=ts)
+            last["message"]["stop_reason"] = "end_turn"
+            _write_session(root / "p1", "S1", [first, last])
+
+            r = list(monitor.iter_records(root))[0]
+            self.assertEqual(r.stop_reason, "end_turn")
+
+
+class SessionEventsTest(unittest.TestCase):
+    """The optional events dict must accumulate counters from `user` and
+    `attachment` entries without disturbing Record extraction."""
+
+    @staticmethod
+    def _user_event(session_id: str, tool_result=None, **top) -> dict:
+        e = {"type": "user", "sessionId": session_id,
+             "timestamp": "2026-04-15T12:00:00.000Z",
+             "message": {"role": "user", "content": "x"}}
+        if tool_result is not None:
+            e["toolUseResult"] = tool_result
+        e.update(top)
+        return e
+
+    def test_events_collected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sess = "S1"
+            entries = [
+                _assistant_event(session_id=sess, msg_id="m1",
+                                 timestamp="2026-04-15T12:00:00.000Z"),
+                # big stdout blob
+                self._user_event(sess, {"stdout": "x" * 70_000, "stderr": ""}),
+                # interrupted run + hand-modified edit
+                self._user_event(sess, {"stdout": "", "interrupted": True}),
+                self._user_event(sess, {"filePath": "/a.py", "userModified": True}),
+                # whole-file read of a large file
+                self._user_event(sess, {"file": {"filePath": "/big.py",
+                                                 "numLines": 900,
+                                                 "totalLines": 900}}),
+                # permission denial
+                self._user_event(sess, toolDenialKind="permission-rule"),
+                # failing hook attachment
+                {"type": "attachment", "sessionId": sess,
+                 "attachment": {"type": "hook_non_blocking_error"}},
+            ]
+            _write_session(root / "c--Users-u-proj", sess, entries)
+
+            events: dict = {}
+            records = list(monitor.iter_records(root, events=events))
+            self.assertEqual(len(records), 1)
+            ev = events[sess]
+            self.assertEqual(ev["project"], "c--Users-u-proj")
+            self.assertGreaterEqual(ev["tool_result_chars"], 70_000)
+            self.assertEqual(ev["big_results"], 1)
+            self.assertEqual(ev["interrupts"], 1)
+            self.assertEqual(ev["user_modified_edits"], 1)
+            self.assertEqual(ev["full_reads"], 1)
+            self.assertEqual(ev["full_read_lines"], 900)
+            self.assertEqual(ev["denials_rule"], 1)
+            self.assertEqual(ev["hook_errors"], 1)
+
+
+class NewRulesTest(unittest.TestCase):
+    @staticmethod
+    def _by_rule(suggestions, rule):
+        return [s for s in suggestions if s.rule == rule]
+
+    def test_truncated_output_fires(self):
+        recs = [_mk_rec(msg_id=f"m{i}", stop_reason="max_tokens")
+                for i in range(2)]
+        hits = self._by_rule(monitor.analyze_suggestions(recs), "truncated-output")
+        self.assertEqual(len(hits), 1)
+        self.assertGreater(hits[0].est_savings, 0)
+
+    def test_truncated_output_single_call_silent(self):
+        recs = [_mk_rec(stop_reason="max_tokens")]
+        self.assertEqual(
+            self._by_rule(monitor.analyze_suggestions(recs), "truncated-output"), [])
+
+    def test_runaway_prompt_fires_once_per_session(self):
+        recs = [_mk_rec(msg_id=f"m{i}", cost=0.30, prompt_id="p1")
+                for i in range(22)]
+        recs += [_mk_rec(msg_id=f"n{i}", cost=0.30, prompt_id="p2")
+                 for i in range(21)]
+        hits = self._by_rule(monitor.analyze_suggestions(recs), "runaway-prompt")
+        self.assertEqual(len(hits), 1, "worst prompt only, one finding per session")
+
+    def test_cache_miss_cause_fires_with_savings(self):
+        recs = [_mk_rec(msg_id=f"m{i}", cache_miss_reason="tools_changed",
+                        cache_missed_tokens=50_000)
+                for i in range(3)]
+        hits = self._by_rule(monitor.analyze_suggestions(recs), "cache-miss-cause")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("tools_changed", hits[0].evidence)
+        self.assertGreater(hits[0].est_savings, 0)
+
+    def test_unfixable_miss_reason_silent(self):
+        recs = [_mk_rec(msg_id=f"m{i}", cache_miss_reason="unavailable")
+                for i in range(5)]
+        self.assertEqual(
+            self._by_rule(monitor.analyze_suggestions(recs), "cache-miss-cause"), [])
+
+    def test_web_search_spend_fires(self):
+        recs = [_mk_rec(msg_id=f"m{i}", web_searches=100) for i in range(3)]
+        hits = self._by_rule(monitor.analyze_suggestions(recs), "web-search-spend")
+        self.assertEqual(len(hits), 1)
+
+    def test_api_error_retries_fires(self):
+        recs = [_mk_rec(msg_id=f"m{i}", api_error=True) for i in range(3)]
+        hits = self._by_rule(monitor.analyze_suggestions(recs), "api-error-retries")
+        self.assertEqual(len(hits), 1)
+
+
+class EventRulesTest(unittest.TestCase):
+    @staticmethod
+    def _ev(**kw) -> dict:
+        ev = monitor.empty_session_events()
+        ev["project"] = "c--Users-u-proj"
+        ev.update(kw)
+        return ev
+
+    @staticmethod
+    def _by_rule(suggestions, rule):
+        return [s for s in suggestions if s.rule == rule]
+
+    def test_tool_result_bloat_fires(self):
+        recs = [_mk_rec()]
+        events = {"S1": self._ev(tool_result_chars=800_000)}
+        hits = self._by_rule(monitor.analyze_suggestions(recs, events),
+                             "tool-result-bloat")
+        self.assertEqual(len(hits), 1)
+        self.assertGreater(hits[0].est_savings, 0)
+
+    def test_event_rules_respect_record_window(self):
+        # Session with events but no surviving records must not fire.
+        recs = [_mk_rec(sess="OTHER")]
+        events = {"S1": self._ev(tool_result_chars=800_000, hook_errors=10)}
+        sugg = monitor.analyze_suggestions(recs, events)
+        self.assertEqual(self._by_rule(sugg, "tool-result-bloat"), [])
+        self.assertEqual(self._by_rule(sugg, "hook-error-spam"), [])
+
+    def test_hook_error_spam_fires(self):
+        recs = [_mk_rec()]
+        events = {"S1": self._ev(hook_errors=5)}
+        hits = self._by_rule(monitor.analyze_suggestions(recs, events),
+                             "hook-error-spam")
+        self.assertEqual(len(hits), 1)
+
+    def test_permission_friction_fires(self):
+        recs = [_mk_rec()]
+        events = {"S1": self._ev(denials_rule=3, denials_user=1)}
+        hits = self._by_rule(monitor.analyze_suggestions(recs, events),
+                             "permission-friction")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("rejected by hand", hits[0].evidence)
+
+    def test_edit_churn_fires(self):
+        recs = [_mk_rec()]
+        events = {"S1": self._ev(user_modified_edits=3)}
+        hits = self._by_rule(monitor.analyze_suggestions(recs, events),
+                             "edit-churn")
+        self.assertEqual(len(hits), 1)
+
+    def test_full_file_reads_and_interrupts_fire(self):
+        recs = [_mk_rec()]
+        events = {"S1": self._ev(full_reads=5, full_read_lines=5_000,
+                                 interrupts=3)}
+        sugg = monitor.analyze_suggestions(recs, events)
+        self.assertEqual(len(self._by_rule(sugg, "full-file-reads")), 1)
+        self.assertEqual(len(self._by_rule(sugg, "interrupted-turns")), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
