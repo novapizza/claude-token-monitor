@@ -332,7 +332,7 @@ This is typically sharper than library-rendered PDF, and needs no extra install.
 
 ## Suggestions engine
 
-`suggest` runs 13 rules over your logs and flags concrete, dollar-quantified
+`suggest` runs 25 rules over your logs and flags concrete, dollar-quantified
 recommendations. The same output is appended to `report --format html` as an
 "Efficiency Suggestions" section.
 
@@ -352,6 +352,17 @@ recommendations. The same output is appended to `report --format html` as an
 | `expensive-single-call` | Session contains any single API call > $5. High severity when any call ≥ $10 | Investigate the peak call — usually a huge file paste, runaway tool loop, or Opus turn that pulled in a massive context |
 | `cache-cold-session` | Session ≥ 5 calls AND cost > $2 AND cache hit rate < 30% | Keep related work in one session; avoid mid-task `/clear`. Distinct from `low-cache-hit` (per-project) — this catches single cold sessions inside an otherwise-warm project |
 | `excessive-clear` | Session contains ≥ 3 `/clear` slash commands (≥ 5 = high severity) | Each `/clear` discards the prompt cache and forces the next turn to pay full cache-write rates. Read from `~/.claude/history.jsonl`. Savings estimated as `median_cache_rebuild_cost × (n_clears − 1)` |
+| `truncated-output` | ≥ 2 calls in a session hit the output-token ceiling (`stop_reason: max_tokens`) | The cut-off output was paid for and regenerated — ask for smaller chunks (diffs, split writes) |
+| `runaway-prompt` | One user prompt (grouped by `promptId`) spawns ≥ 20 API calls and ≥ $5 (high ≥ $15) | Points at the specific *ask* that spiraled — plan first or split the task. One finding per session (its worst prompt) |
+| `cache-miss-cause` | ≥ 3 cache misses in a project share a fixable cause from the API's own `cache_miss_reason` diagnostics (`tools_changed`, `model_changed`, `system_changed`, `messages_changed`, `previous_message_not_found`) | Names the actual cause instead of inferring it — e.g. "MCP servers connecting mid-session rebuild the whole prefix". Savings from the reported re-written token counts |
+| `web-search-spend` | Server-side web searches ≥ $2 in a project ($10 per 1K requests, billed on top of tokens) | Point Claude at local docs or pinned URLs. This spend is also now included in every cost figure |
+| `api-error-retries` | ≥ 3 errored API calls in one session | Retry overhead, not useful work — back off or trim context instead of hammering |
+| `tool-result-bloat` | ~150K+ tokens of tool output entered a session's context, or ≥ 3 single results > 15K tokens | Pipe noisy build/test commands through tail or a filter; prefer quiet flags |
+| `full-file-reads` | ≥ 5 whole-file reads of ≥ 500-line files in a session | Nudge toward ranged reads (offset/limit) or Grep-first navigation |
+| `hook-error-spam` | A failing hook's error text injected ≥ 5 times in a project | Fix or remove the hook — every injection costs input tokens on every affected turn |
+| `permission-friction` | ≥ 3 tool calls blocked by permission rules in a project | Allowlist the safe commands in `.claude/settings.json` — each denial burns a turn on retries |
+| `edit-churn` | ≥ 3 Claude edits hand-modified by the user afterwards in a project | The model's changes don't match project conventions — capture the recurring corrections in CLAUDE.md |
+| `interrupted-turns` | ≥ 3 tool runs killed mid-flight in a session | The aborted output was still paid for — tighter prompts or plan mode up front is cheaper |
 
 Rules 8, 9 and 10 check the project's `Read` file extensions against
 ast-graph's supported languages (Rust, Python, JS/TS, C#, Java) — the
@@ -422,7 +433,7 @@ leaves your machine.
 
 | Path | Used for | Privacy |
 |---|---|---|
-| `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` | Per-call usage, model, tools, plan-mode detection — the primary source | Read in full (it's already on disk) |
+| `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` | Per-call usage, model, tools, plan-mode detection, plus `stop_reason` / reasoning `effort` / `promptId` / attributed skill / cache-miss diagnostics / web-search counts, and per-session signals from `user` + `attachment` entries (tool-output size, whole-file reads, permission denials, interrupts, failing hooks, hand-modified edits) — the primary source | Read in full (it's already on disk). Tool-output entries are measured by **length only** — the content is never retained |
 | `~/.claude/.credentials.json` | Subscription tier banner (`Pro` / `Max` / `Max 20x` / `Team` / `Enterprise`). macOS Keychain not implemented yet — Mac users get no banner | Only `subscriptionType` and `rateLimitTier` are read; OAuth tokens are ignored |
 | `~/.claude/history.jsonl` | Slash-command histogram in `summary` and the `excessive-clear` rule | **Prompt text is never retained.** Only the slash command (first word after `/`), timestamps, session/project IDs, and total pasted-content character count are kept. Raw `display` strings are dropped at parse time |
 

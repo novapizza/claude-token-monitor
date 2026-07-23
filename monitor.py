@@ -62,6 +62,10 @@ PRICING: dict[str, dict[str, float]] = {
 }
 DEFAULT_PRICE = {"in": 3.0, "out": 15.0, "cr": 0.30, "cw_5m": 3.75, "cw_1h": 6.0}
 
+# Server-side tool pricing — billed per request, not per token, and the same
+# across models. Web search: $10 per 1,000 searches.
+WEB_SEARCH_PRICE_PER_1K = 10.0
+
 
 def model_price(model: str) -> dict[str, float]:
     m = (model or "").lower()
@@ -84,12 +88,16 @@ def calc_cost(usage: dict, model: str) -> float:
     cw_1h = int(creation.get("ephemeral_1h_input_tokens") or 0)
     if not creation:
         cw_5m = int(usage.get("cache_creation_input_tokens") or 0)
+    # Server-side tools (web search) bill per request on top of tokens.
+    stu = usage.get("server_tool_use")
+    searches = int(stu.get("web_search_requests") or 0) if isinstance(stu, dict) else 0
     return (
         inp   * p["in"]    / 1_000_000
         + out * p["out"]   / 1_000_000
         + cr  * p["cr"]    / 1_000_000
         + cw_5m * p["cw_5m"] / 1_000_000
         + cw_1h * p["cw_1h"] / 1_000_000
+        + searches * WEB_SEARCH_PRICE_PER_1K / 1_000
     )
 
 
@@ -391,6 +399,14 @@ class Record:
     msg_id: str
     tools: list = None  # list[str] of tool names used in this assistant turn
     read_paths: list = None  # list[str] of file_path args passed to the Read tool
+    stop_reason: str = ""         # e.g. "tool_use" | "end_turn" | "max_tokens"
+    effort: str = ""              # reasoning effort dial ("low" … "max")
+    prompt_id: str = ""           # groups all calls spawned by one user prompt
+    skill: str = ""               # attributionSkill — skill/command that drove this call
+    cache_miss_reason: str = ""   # diagnostics.cache_miss_reason.type, if any
+    cache_missed_tokens: int = 0  # tokens the miss forced to re-write, if reported
+    api_error: bool = False       # isApiErrorMessage — errored/retried call
+    web_searches: int = 0         # server-side web search requests in this call
 
     def __post_init__(self):
         if self.tools is None:
@@ -421,13 +437,94 @@ def _extract_tool_info(msg: dict) -> tuple[list[str], list[str]]:
     return tools, paths
 
 
-def iter_records(root: Path) -> Iterator[Record]:
+def empty_session_events() -> dict:
+    """Per-session counters harvested from non-assistant JSONL entries.
+
+    Only sizes and counts are kept — never content — so collecting them
+    adds no meaningful memory over the existing per-line json.loads.
+    """
+    return {
+        "project": "",
+        "tool_result_chars": 0,     # total chars of tool output fed back as input
+        "big_results": 0,           # tool results larger than _BIG_RESULT_CHARS
+        "biggest_result_chars": 0,
+        "full_reads": 0,            # Read results that consumed the whole file
+        "full_read_lines": 0,       # total lines pulled in by those full reads
+        "denials_user": 0,          # tool calls the user rejected by hand
+        "denials_rule": 0,          # tool calls blocked by a permission rule
+        "interrupts": 0,            # tool runs the user killed mid-flight
+        "hook_errors": 0,           # hook_non_blocking_error attachments injected
+        "user_modified_edits": 0,   # Edit/Write results the user then hand-edited
+    }
+
+
+_FULL_READ_MIN_LINES = 500   # a "whole file" only counts when the file is big
+_BIG_RESULT_CHARS = 60_000   # ~15K tokens in one tool result
+
+
+def _tool_result_chars(tr: dict) -> int:
+    """Size of a toolUseResult payload in chars, content untouched."""
+    chars = 0
+    for k in ("stdout", "stderr"):
+        v = tr.get(k)
+        if isinstance(v, str):
+            chars += len(v)
+    c = tr.get("content")
+    if isinstance(c, str):
+        chars += len(c)
+    elif isinstance(c, list):
+        for block in c:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                chars += len(block["text"])
+    fobj = tr.get("file")
+    if isinstance(fobj, dict) and isinstance(fobj.get("content"), str):
+        chars += len(fobj["content"])
+    return chars
+
+
+def _collect_user_event(e: dict, ev: dict) -> None:
+    """Fold one `user` JSONL entry into the session's event counters."""
+    kind = e.get("toolDenialKind")
+    if kind == "user-rejected":
+        ev["denials_user"] += 1
+    elif kind:
+        ev["denials_rule"] += 1
+    tr = e.get("toolUseResult")
+    if isinstance(tr, str):
+        ev["tool_result_chars"] += len(tr)
+        return
+    if not isinstance(tr, dict):
+        return
+    chars = _tool_result_chars(tr)
+    ev["tool_result_chars"] += chars
+    if chars > ev["biggest_result_chars"]:
+        ev["biggest_result_chars"] = chars
+    if chars >= _BIG_RESULT_CHARS:
+        ev["big_results"] += 1
+    if tr.get("interrupted") is True:
+        ev["interrupts"] += 1
+    if tr.get("userModified") is True:
+        ev["user_modified_edits"] += 1
+    # Read results carry line counts either at top level or under `file`.
+    src = tr.get("file") if isinstance(tr.get("file"), dict) else tr
+    num, tot = src.get("numLines"), src.get("totalLines")
+    if (isinstance(num, int) and isinstance(tot, int)
+            and tot >= _FULL_READ_MIN_LINES and num >= tot):
+        ev["full_reads"] += 1
+        ev["full_read_lines"] += tot
+
+
+def iter_records(root: Path, events: dict | None = None) -> Iterator[Record]:
     """Yield one Record per distinct assistant API call.
 
     Multiple JSONL entries share the same message.id when an assistant
     turn has several content blocks. Their `usage` block is the full
     per-call total and is duplicated — so we dedupe by (session, msg_id)
     and accumulate tool_use blocks across entries with the same id.
+
+    When `events` (a dict) is passed, it is filled in place with
+    session_id -> empty_session_events()-shaped counters harvested from
+    the `user` and `attachment` entries the Record pipeline skips.
     """
     if not root.exists():
         return
@@ -451,7 +548,20 @@ def iter_records(root: Path) -> Iterator[Record]:
                         e = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if e.get("type") != "assistant":
+                    etype = e.get("type")
+                    if etype != "assistant":
+                        if events is not None:
+                            sid = e.get("sessionId") or ""
+                            if etype == "user" and sid:
+                                ev = events.setdefault(sid, empty_session_events())
+                                ev["project"] = project_dir.name
+                                _collect_user_event(e, ev)
+                            elif etype == "attachment" and sid:
+                                a = e.get("attachment") or {}
+                                if a.get("type") == "hook_non_blocking_error":
+                                    ev = events.setdefault(sid, empty_session_events())
+                                    ev["project"] = project_dir.name
+                                    ev["hook_errors"] += 1
                         continue
                     msg = e.get("message") or {}
                     msg_id = msg.get("id") or ""
@@ -471,6 +581,9 @@ def iter_records(root: Path) -> Iterator[Record]:
                         usage = msg.get("usage")
                         if usage:
                             model = msg.get("model") or "unknown"
+                            diag = msg.get("diagnostics")
+                            miss = diag.get("cache_miss_reason") if isinstance(diag, dict) else None
+                            stu = usage.get("server_tool_use")
                             info["base"] = {
                                 "project": project_dir.name,
                                 "session_id": session_id,
@@ -480,7 +593,28 @@ def iter_records(root: Path) -> Iterator[Record]:
                                 "cost": calc_cost(usage, model),
                                 "cwd": e.get("cwd") or "",
                                 "msg_id": msg_id,
+                                "stop_reason": msg.get("stop_reason") or "",
+                                "effort": e.get("effort") or "",
+                                "prompt_id": e.get("promptId") or "",
+                                "skill": e.get("attributionSkill") or "",
+                                "cache_miss_reason": (
+                                    miss.get("type") or "" if isinstance(miss, dict)
+                                    else (miss or "")
+                                ),
+                                "cache_missed_tokens": (
+                                    int(miss.get("cache_missed_input_tokens") or 0)
+                                    if isinstance(miss, dict) else 0
+                                ),
+                                "api_error": bool(e.get("isApiErrorMessage")),
+                                "web_searches": (
+                                    int(stu.get("web_search_requests") or 0)
+                                    if isinstance(stu, dict) else 0
+                                ),
                             }
+                    elif msg.get("stop_reason"):
+                        # Split entries: only the final chunk carries the
+                        # definitive stop_reason — keep the last non-null one.
+                        info["base"]["stop_reason"] = msg["stop_reason"]
 
     for info in partial.values():
         base = info["base"]
@@ -541,13 +675,13 @@ def fmt_bytes(n: int) -> str:
     return f"{f:.1f} TB"
 
 
-def load_all() -> list[Record]:
-    return list(iter_records(projects_root()))
+def load_all(events: dict | None = None) -> list[Record]:
+    return list(iter_records(projects_root(), events=events))
 
 
-def load_records(args) -> list[Record]:
+def load_records(args, events: dict | None = None) -> list[Record]:
     """load_all() with --since/--until/--last from args applied."""
-    return filter_records(load_all(), args)
+    return filter_records(load_all(events), args)
 
 
 # ----------------------- Tier-2 routing analytics ----------------------- #
@@ -1055,7 +1189,8 @@ def _recent_activity_snapshot(records: list) -> dict:
 
 
 def cmd_summary(args) -> None:
-    records = load_records(args)
+    events: dict = {}
+    records = load_records(args, events=events)
     if not records:
         print("No usage records found in", projects_root())
         return
@@ -1129,7 +1264,7 @@ def cmd_summary(args) -> None:
     _render_recent_activity(console, snap)
     _render_user_input_summary(console, load_user_inputs(), args)
 
-    suggestions = analyze_suggestions(records)
+    suggestions = analyze_suggestions(records, events)
     _render_alert_banners(console, suggestions)
     if suggestions:
         _render_suggestions(console, suggestions, top=5)
@@ -1228,7 +1363,8 @@ def _render_recent_activity(console, snap: dict) -> None:
 
 
 def cmd_daily(args) -> None:
-    records = load_records(args)
+    events: dict = {}
+    records = load_records(args, events=events)
     by_day = aggregate(
         records,
         lambda r: parse_ts(r.timestamp).date().isoformat() if parse_ts(r.timestamp) else None,
@@ -1262,13 +1398,14 @@ def cmd_daily(args) -> None:
     console.print(t)
     console.print(f"[bold]Total for window:[/bold] [green]{fmt_cost(total_cost)}[/green]")
 
-    suggestions = analyze_suggestions(records)
+    suggestions = analyze_suggestions(records, events)
     if suggestions:
         _render_suggestions(console, suggestions, top=3)
 
 
 def cmd_projects(args) -> None:
-    records = load_records(args)
+    events: dict = {}
+    records = load_records(args, events=events)
     by_project = aggregate(records, lambda r: r.project)
     if not by_project:
         print("No records.")
@@ -1294,7 +1431,7 @@ def cmd_projects(args) -> None:
                   fmt_cost(a["cost"]), last)
     console.print(t)
 
-    suggestions = analyze_suggestions(records)
+    suggestions = analyze_suggestions(records, events)
     if suggestions:
         _render_suggestions(console, suggestions, top=3)
 
@@ -2004,7 +2141,8 @@ def cmd_report(args) -> None:
     width = args.width
     console = Console(record=True, width=width, force_terminal=True, color_system="truecolor")
 
-    records = load_records(args)
+    events: dict = {}
+    records = load_records(args, events=events)
 
     # Optional project filter
     project_label: str | None = None
@@ -2324,7 +2462,7 @@ def cmd_report(args) -> None:
         # Section 7: suggestions (with large-context alert pinned above)
         console.print()
         console.rule("[bold]Efficiency Suggestions[/bold]")
-        suggestions = analyze_suggestions(records)
+        suggestions = analyze_suggestions(records, events)
         _render_alert_banners(console, suggestions)
         _render_suggestions(console, suggestions, top=15)
 
@@ -3300,7 +3438,412 @@ def _rule_excessive_clear(records: list[Record]) -> list[Suggestion]:
     return out
 
 
-def analyze_suggestions(records: list[Record]) -> list[Suggestion]:
+_TRUNCATED_MIN = 2  # ≥2 max_tokens truncations in one session → flagged
+
+
+def _rule_truncated_output(records: list[Record]) -> list[Suggestion]:
+    """Rule 15: calls that hit the output-token ceiling (stop_reason
+    max_tokens). The truncated output was paid for, then usually thrown
+    away and regenerated — near-pure waste."""
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id and r.stop_reason == "max_tokens":
+            by_session[r.session_id].append(r)
+    out: list[Suggestion] = []
+    for sess, recs in by_session.items():
+        if len(recs) < _TRUNCATED_MIN:
+            continue
+        # Half the output cost of truncated calls is a conservative floor
+        # for the regeneration waste.
+        wasted = sum(
+            int(r.usage.get("output_tokens") or 0) * model_price(r.model)["out"] / 1_000_000
+            for r in recs
+        ) * 0.5
+        proj = shorten_path(decode_project(recs[0].project))
+        out.append(Suggestion(
+            rule="truncated-output",
+            severity="med" if len(recs) >= 4 else "low",
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=f"{len(recs)} calls cut off at the output-token limit (stop_reason=max_tokens)",
+            action=(
+                "Truncated turns get regenerated — ask for smaller chunks "
+                "(split large file writes, request diffs instead of whole files)."
+            ),
+            est_savings=wasted,
+        ))
+    return out
+
+
+_RUNAWAY_MIN_CALLS = 20
+_RUNAWAY_MIN_COST_USD = 5.0
+_RUNAWAY_ALERT_COST_USD = 15.0
+
+
+def _rule_runaway_prompt(records: list[Record]) -> list[Suggestion]:
+    """Rule 16: a single user prompt that spiraled into a long agentic loop.
+
+    Groups calls by promptId — unlike session- or call-level rules this
+    points at the specific *ask* that ran away, which is what the user can
+    actually change (plan first, split the task, tighten the request).
+    """
+    by_prompt: dict[tuple[str, str], list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id and r.prompt_id:
+            by_prompt[(r.session_id, r.prompt_id)].append(r)
+    out: list[Suggestion] = []
+    flagged_sessions: set[str] = set()
+    for (sess, _pid), recs in sorted(
+        by_prompt.items(),
+        key=lambda kv: -sum(r.cost for r in kv[1]),
+    ):
+        cost = sum(r.cost for r in recs)
+        if len(recs) < _RUNAWAY_MIN_CALLS or cost < _RUNAWAY_MIN_COST_USD:
+            continue
+        if sess in flagged_sessions:   # one finding per session — the worst prompt
+            continue
+        flagged_sessions.add(sess)
+        proj = shorten_path(decode_project(recs[0].project))
+        out.append(Suggestion(
+            rule="runaway-prompt",
+            severity="high" if cost >= _RUNAWAY_ALERT_COST_USD else "med",
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=(
+                f"one prompt ran {len(recs)} API calls · {fmt_cost(cost)} "
+                f"before returning control"
+            ),
+            action=(
+                "A single ask turned into a long agentic loop. For requests "
+                "this open-ended, start in plan mode or split the task into "
+                "reviewable steps."
+            ),
+            est_savings=0.0,
+        ))
+    return out
+
+
+# Advice per diagnostics.cache_miss_reason.type. Only causes the user can
+# influence produce a suggestion; server-side blips ("unavailable") don't.
+_CACHE_MISS_ADVICE = {
+    "tools_changed": (
+        "Tool definitions changed mid-session (MCP servers connecting or "
+        "dropping, dynamic tools) — each change rebuilds the whole prefix. "
+        "Keep the tool set stable while a session is active."
+    ),
+    "model_changed": (
+        "The model was switched mid-session — every switch rewrites the "
+        "cache. Batch model changes at session boundaries."
+    ),
+    "system_changed": (
+        "The system prompt changed mid-session (CLAUDE.md or settings "
+        "edits, mode flips) — avoid editing global config during active "
+        "sessions."
+    ),
+    "messages_changed": (
+        "Conversation history was rewritten (rewind, edited messages) — "
+        "each rewrite forces a cache rebuild from that point."
+    ),
+    "previous_message_not_found": (
+        "The cache expired between turns (idle gap longer than the TTL). "
+        "Work in focused bursts, or expect a rebuild after long pauses."
+    ),
+}
+
+_CACHE_MISS_MIN_COUNT = 3
+
+
+def _rule_cache_miss_causes(records: list[Record]) -> list[Suggestion]:
+    """Rule 17: name the *cause* of cache misses using the API's own
+    diagnostics instead of inferring it statistically. Complements rules
+    3/7/13, which detect the symptom."""
+    by_proj: dict[str, dict[str, list[Record]]] = defaultdict(lambda: defaultdict(list))
+    for r in records:
+        if r.cache_miss_reason in _CACHE_MISS_ADVICE:
+            by_proj[r.project][r.cache_miss_reason].append(r)
+    out: list[Suggestion] = []
+    for proj, by_reason in by_proj.items():
+        reason, recs = max(by_reason.items(), key=lambda kv: len(kv[1]))
+        if len(recs) < _CACHE_MISS_MIN_COUNT:
+            continue
+        # The missed tokens were re-written to cache instead of read from
+        # it — the price gap between those two rates is the waste.
+        savings = sum(
+            r.cache_missed_tokens
+            * (model_price(r.model)["cw_5m"] - model_price(r.model)["cr"])
+            / 1_000_000
+            for r in recs
+        )
+        missed_tok = sum(r.cache_missed_tokens for r in recs)
+        evidence = f"{len(recs)} cache misses, reason `{reason}`"
+        if missed_tok:
+            evidence += f" · {fmt_num(missed_tok)} tokens re-written"
+        out.append(Suggestion(
+            rule="cache-miss-cause",
+            severity="med" if savings >= 1.0 else "low",
+            scope=_short_scope_project(proj),
+            evidence=evidence,
+            action=_CACHE_MISS_ADVICE[reason],
+            est_savings=savings,
+        ))
+    return out
+
+
+_WEB_SEARCH_MIN_COST_USD = 2.0
+
+
+def _rule_web_search_spend(records: list[Record]) -> list[Suggestion]:
+    """Rule 18: surface server-side web search spend — billed per request
+    ($10/1K) on top of tokens, and easy to rack up invisibly."""
+    by_proj: dict[str, int] = defaultdict(int)
+    for r in records:
+        if r.web_searches:
+            by_proj[r.project] += r.web_searches
+    out: list[Suggestion] = []
+    for proj, n in by_proj.items():
+        cost = n * WEB_SEARCH_PRICE_PER_1K / 1_000
+        if cost < _WEB_SEARCH_MIN_COST_USD:
+            continue
+        out.append(Suggestion(
+            rule="web-search-spend",
+            severity="low",
+            scope=_short_scope_project(proj),
+            evidence=f"{fmt_num(n)} server-side web searches · {fmt_cost(cost)} in per-request fees",
+            action=(
+                "Web search bills per request on top of tokens. Point Claude "
+                "at local docs or pinned URLs where possible."
+            ),
+            est_savings=0.0,
+        ))
+    return out
+
+
+_API_ERROR_MIN = 3
+
+
+def _rule_api_error_retries(records: list[Record]) -> list[Suggestion]:
+    """Rule 19: sessions with repeated errored API calls — their cost is
+    retry overhead, not useful work."""
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id and r.api_error:
+            by_session[r.session_id].append(r)
+    out: list[Suggestion] = []
+    for sess, recs in by_session.items():
+        if len(recs) < _API_ERROR_MIN:
+            continue
+        cost = sum(r.cost for r in recs)
+        proj = shorten_path(decode_project(recs[0].project))
+        out.append(Suggestion(
+            rule="api-error-retries",
+            severity="low",
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=f"{len(recs)} errored API calls · {fmt_cost(cost)} spent on failed turns",
+            action=(
+                "Repeated API errors usually mean overload windows or an "
+                "oversized request — if it recurs, retry later or trim the "
+                "context instead of hammering."
+            ),
+            est_savings=cost,
+        ))
+    return out
+
+
+# ---- event-based rules: use per-session counters from non-assistant entries
+
+
+def _session_label(sess: str, ev: dict) -> str:
+    proj = shorten_path(decode_project(ev.get("project") or "")) or "unknown"
+    return f"session {sess[:8]} ({proj})"
+
+
+_BLOAT_MIN_TOKENS = 150_000   # ≈ chars/4 of tool output fed back into context
+
+
+def _rule_tool_result_bloat(records: list[Record], events: dict) -> list[Suggestion]:
+    """Rule 20: sessions where tool output (build logs, test runs, huge
+    file reads) flooded the context. That text is paid for as cache writes
+    and re-read on every later call."""
+    model_by_sess: dict[str, str] = {}
+    for r in records:
+        model_by_sess.setdefault(r.session_id, r.model)
+    out: list[Suggestion] = []
+    for sess, ev in events.items():
+        tokens = ev["tool_result_chars"] // 4
+        if tokens < _BLOAT_MIN_TOKENS and ev["big_results"] < 3:
+            continue
+        p = model_price(model_by_sess.get(sess, ""))
+        # Written to cache once; assume half of it was avoidable noise.
+        savings = tokens * p["cw_5m"] / 1_000_000 * 0.5
+        evidence = f"~{fmt_num(tokens)} tokens of tool output entered context"
+        if ev["big_results"]:
+            evidence += (
+                f" · {ev['big_results']} single results >"
+                f"{fmt_num(_BIG_RESULT_CHARS // 4)} tok "
+                f"(largest ~{fmt_num(ev['biggest_result_chars'] // 4)})"
+            )
+        out.append(Suggestion(
+            rule="tool-result-bloat",
+            severity="med" if tokens >= 2 * _BLOAT_MIN_TOKENS else "low",
+            scope=_session_label(sess, ev),
+            evidence=evidence,
+            action=(
+                "Filter noisy commands before they hit the context: pipe "
+                "test/build output through tail or a summarizer, and prefer "
+                "quiet flags (-q, --quiet) on verbose tools."
+            ),
+            est_savings=savings,
+        ))
+    return out
+
+
+_FULL_READS_MIN = 5
+
+
+def _rule_full_file_reads(records: list[Record], events: dict) -> list[Suggestion]:
+    """Rule 21: sessions that repeatedly read entire large files when a
+    ranged read (offset/limit) would have carried a fraction of the tokens."""
+    out: list[Suggestion] = []
+    for sess, ev in events.items():
+        if ev["full_reads"] < _FULL_READS_MIN:
+            continue
+        out.append(Suggestion(
+            rule="full-file-reads",
+            severity="low",
+            scope=_session_label(sess, ev),
+            evidence=(
+                f"{ev['full_reads']} whole-file reads of "
+                f"≥{_FULL_READ_MIN_LINES}-line files "
+                f"({fmt_num(ev['full_read_lines'])} lines total)"
+            ),
+            action=(
+                "Large files were read end-to-end repeatedly. Nudge Claude "
+                "toward ranged reads (offset/limit) or Grep-first navigation "
+                "— e.g. a CLAUDE.md note for this project."
+            ),
+            est_savings=0.0,
+        ))
+    return out
+
+
+_HOOK_ERROR_MIN = 5
+
+
+def _rule_hook_error_spam(records: list[Record], events: dict) -> list[Suggestion]:
+    """Rule 22: a failing hook whose error text is injected into the
+    context over and over — every injection costs input tokens, and it
+    signals the hook isn't doing its job anyway."""
+    by_proj: dict[str, int] = defaultdict(int)
+    for ev in events.values():
+        if ev["hook_errors"]:
+            by_proj[ev.get("project") or "unknown"] += ev["hook_errors"]
+    out: list[Suggestion] = []
+    for proj, n in by_proj.items():
+        if n < _HOOK_ERROR_MIN:
+            continue
+        out.append(Suggestion(
+            rule="hook-error-spam",
+            severity="med",
+            scope=_short_scope_project(proj),
+            evidence=f"hook errors injected into context {n} times",
+            action=(
+                "A configured hook keeps failing and its error text is fed "
+                "into every affected turn. Fix or remove the hook "
+                "(settings.json → hooks)."
+            ),
+            est_savings=0.0,
+        ))
+    return out
+
+
+_DENIAL_RULE_MIN = 3
+
+
+def _rule_permission_friction(records: list[Record], events: dict) -> list[Suggestion]:
+    """Rule 23: tool calls repeatedly blocked by permission rules — each
+    denial wastes a turn (the model retries or reroutes) and interrupts
+    flow. Suggest allowlisting the safe ones."""
+    by_proj: dict[str, dict[str, int]] = defaultdict(lambda: {"rule": 0, "user": 0})
+    for ev in events.values():
+        proj = ev.get("project") or "unknown"
+        by_proj[proj]["rule"] += ev["denials_rule"]
+        by_proj[proj]["user"] += ev["denials_user"]
+    out: list[Suggestion] = []
+    for proj, d in by_proj.items():
+        if d["rule"] < _DENIAL_RULE_MIN:
+            continue
+        evidence = f"{d['rule']} tool calls blocked by permission rules"
+        if d["user"]:
+            evidence += f" (+{d['user']} rejected by hand)"
+        out.append(Suggestion(
+            rule="permission-friction",
+            severity="low",
+            scope=_short_scope_project(proj),
+            evidence=evidence,
+            action=(
+                "Recurring permission denials burn turns on retries. Allowlist "
+                "the safe commands in .claude/settings.json (or run "
+                "/fewer-permission-prompts)."
+            ),
+            est_savings=0.0,
+        ))
+    return out
+
+
+_EDIT_CHURN_MIN = 3
+
+
+def _rule_edit_churn(records: list[Record], events: dict) -> list[Suggestion]:
+    """Rule 24: edits the user immediately rewrote by hand — the model is
+    producing changes that don't match this project's conventions. The only
+    rule that catches *quality* waste rather than volume waste."""
+    by_proj: dict[str, int] = defaultdict(int)
+    for ev in events.values():
+        if ev["user_modified_edits"]:
+            by_proj[ev.get("project") or "unknown"] += ev["user_modified_edits"]
+    out: list[Suggestion] = []
+    for proj, n in by_proj.items():
+        if n < _EDIT_CHURN_MIN:
+            continue
+        out.append(Suggestion(
+            rule="edit-churn",
+            severity="low",
+            scope=_short_scope_project(proj),
+            evidence=f"{n} Claude edits were hand-modified by the user afterwards",
+            action=(
+                "Frequent hand-fixes after Claude's edits suggest missing "
+                "conventions. Capture the recurring corrections in this "
+                "project's CLAUDE.md (style, naming, patterns)."
+            ),
+            est_savings=0.0,
+        ))
+    return out
+
+
+_INTERRUPT_MIN = 3
+
+
+def _rule_interrupted_turns(records: list[Record], events: dict) -> list[Suggestion]:
+    """Rule 25: sessions where the user repeatedly killed running turns —
+    the aborted output was still paid for."""
+    out: list[Suggestion] = []
+    for sess, ev in events.items():
+        if ev["interrupts"] < _INTERRUPT_MIN:
+            continue
+        out.append(Suggestion(
+            rule="interrupted-turns",
+            severity="low",
+            scope=_session_label(sess, ev),
+            evidence=f"{ev['interrupts']} tool runs interrupted mid-flight",
+            action=(
+                "Frequent interrupts mean Claude was heading the wrong way — "
+                "tighter prompts or plan mode up front is cheaper than "
+                "killing turns after they start."
+            ),
+            est_savings=0.0,
+        ))
+    return out
+
+
+def analyze_suggestions(records: list[Record], events: dict | None = None) -> list[Suggestion]:
     rules = [
         _rule_opus_heavy_project,
         _rule_opus_routine_session,
@@ -3316,10 +3859,30 @@ def analyze_suggestions(records: list[Record]) -> list[Suggestion]:
         _rule_expensive_single_call,
         _rule_cache_cold_session,
         _rule_excessive_clear,
+        _rule_truncated_output,
+        _rule_runaway_prompt,
+        _rule_cache_miss_causes,
+        _rule_web_search_spend,
+        _rule_api_error_retries,
+    ]
+    event_rules = [
+        _rule_tool_result_bloat,
+        _rule_full_file_reads,
+        _rule_hook_error_spam,
+        _rule_permission_friction,
+        _rule_edit_churn,
+        _rule_interrupted_turns,
     ]
     out: list[Suggestion] = []
     for rule in rules:
         out.extend(rule(records))
+    if events:
+        # Respect the caller's time window: only sessions that still have
+        # records after filtering contribute event findings.
+        sids = {r.session_id for r in records}
+        scoped = {sid: ev for sid, ev in events.items() if sid in sids}
+        for rule in event_rules:
+            out.extend(rule(records, scoped))
     sev_order = {"high": 0, "med": 1, "low": 2}
     out.sort(key=lambda s: (sev_order.get(s.severity, 9), -s.est_savings))
     return out
@@ -3397,11 +3960,12 @@ def _render_suggestions(console, suggestions: list[Suggestion], top: int) -> Non
 
 
 def cmd_suggest(args) -> None:
-    records = load_records(args)
+    events: dict = {}
+    records = load_records(args, events=events)
     if not records:
         print("No records.")
         return
-    suggestions = analyze_suggestions(records)
+    suggestions = analyze_suggestions(records, events)
     if args.min_savings > 0:
         suggestions = [
             s for s in suggestions
